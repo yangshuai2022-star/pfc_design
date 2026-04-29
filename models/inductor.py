@@ -1,0 +1,252 @@
+"""Inductor design and loss model for two-phase interleaved PFC."""
+
+import numpy as np
+
+from ..core.spec import DesignSpec
+from ..core.operating_point import OperatingPoint
+from ..core.constants import rho_cu, MU0, UH_TO_H, CM2_TO_M2
+from ..magnetics.core_entry import CoreSpec
+from ..magnetics.core_database import CoreDatabase
+from ..magnetics.winding import skin_effect_factor, dc_resistance, skin_depth
+from ..magnetics.saturation import (
+    effective_inductance, calculate_b_max, calculate_b_ac, h_dc_oersted,
+    percent_permeability
+)
+from .base import LossResult
+
+
+class InductorDesign:
+    """Result of inductor design calculations."""
+
+    def __init__(self, core: CoreSpec, n_turns: float, L_target_uh: float,
+                 L_noload_uh: float, L_eff_at_ipeak_uh: float,
+                 wire_d_mm: float, n_parallel: int, n_cores: int = 1):
+        self.core = core
+        self.n_turns = n_turns
+        self.L_target_uh = L_target_uh
+        self.L_noload_uh = L_noload_uh
+        self.L_eff_at_ipeak_uh = L_eff_at_ipeak_uh
+        self.wire_d_mm = wire_d_mm
+        self.n_parallel = n_parallel
+        self.n_cores = n_cores
+
+    @property
+    def kw(self) -> float:
+        a_wire_mm2 = np.pi * (self.wire_d_mm / 2) ** 2 * self.n_parallel
+        a_cu_total_mm2 = a_wire_mm2 * self.n_turns
+        aw_mm2 = self.core.aw_cm2 * 100
+        return a_cu_total_mm2 / aw_mm2 if aw_mm2 > 0 else 1.0
+
+    @property
+    def ae_total_cm2(self) -> float:
+        return self.core.ae_cm2 * self.n_cores
+
+    @property
+    def ve_total_cm3(self) -> float:
+        return self.core.ve_cm3 * self.n_cores
+
+
+class InductorDesigner:
+    """Designs a PFC boost inductor."""
+
+    def __init__(self, db: CoreDatabase | None = None):
+        self.db = db or CoreDatabase()
+
+    def design(self, spec: DesignSpec, op: OperatingPoint,
+               preferred_core: CoreSpec | None = None,
+               n_cores: int = 1) -> InductorDesign:
+        """Design the inductor."""
+
+        # Step 1: Calculate required inductance
+        if spec.L_target is not None:
+            L_target_uh = spec.L_target
+        else:
+            L_target_uh = self._calculate_L(spec, op)
+
+        # Step 2: Select core
+        if preferred_core is not None:
+            core = preferred_core
+        else:
+            core = self._select_core(spec, op, L_target_uh)
+
+        # Step 3: Calculate turns from L_target and AL
+        al_total = core.al_nH_per_t2 * n_cores
+        n_al = np.sqrt(L_target_uh * 1000 / al_total) if al_total > 0 else 50
+        n_turns = round(n_al)
+
+        # Step 4: Calculate actual no-load inductance using AL (datasheet value)
+        al_total = core.al_nH_per_t2 * n_cores
+        L_noload_uh = al_total * n_turns**2 / 1000  # nH/t² → μH
+
+        # Step 5: Check saturation using RMS current (Mathcad convention)
+        L_eff = effective_inductance(L_noload_uh, n_turns, op.iin_rms,
+                                     core.le_cm, core.dc_bias_coeffs)
+
+        # Step 6: Iterate to find stable design
+        # Check B_max with effective L at peak current
+        L_eff_peak = effective_inductance(L_noload_uh, n_turns, op.iin_peak,
+                                          core.le_cm, core.dc_bias_coeffs)
+        b_peak = calculate_b_max(L_eff_peak, op.iin_peak, n_turns,
+                                 core.ae_cm2 * n_cores)
+        safe_b = core.bs_T * 0.7
+        iterations = 0
+        while b_peak > safe_b and iterations < 20:
+            n_turns += 1
+            al_total = core.al_nH_per_t2 * n_cores
+            L_noload_uh = al_total * n_turns**2 / 1000
+            L_eff_peak = effective_inductance(L_noload_uh, n_turns, op.iin_peak,
+                                              core.le_cm, core.dc_bias_coeffs)
+            L_eff = effective_inductance(L_noload_uh, n_turns, op.iin_rms,
+                                         core.le_cm, core.dc_bias_coeffs)
+            b_peak = calculate_b_max(L_eff_peak, op.iin_peak, n_turns,
+                                     core.ae_cm2 * n_cores)
+            iterations += 1
+
+        # Step 7: Select wire
+        wire_d_mm, n_parallel = self._select_wire(spec, op, n_turns)
+
+        return InductorDesign(
+            core=core, n_turns=n_turns,
+            L_target_uh=L_target_uh,
+            L_noload_uh=L_noload_uh,
+            L_eff_at_ipeak_uh=L_eff,
+            wire_d_mm=wire_d_mm,
+            n_parallel=n_parallel,
+            n_cores=n_cores,
+        )
+
+    def _calculate_L(self, spec: DesignSpec, op: OperatingPoint) -> float:
+        """L = Vm / (r * fsw * Iin_rms) — Mathcad design formula."""
+        return op.vm / (spec.ripple_ratio * spec.fsw * op.iin_rms) * 1e6
+
+    def _required_ae_n(self, spec: DesignSpec, op: OperatingPoint) -> float:
+        """Compute required Ae*N product (cm²) to keep B_avg below target.
+
+        From Mathcad: integrate(Vac(t)*D(t)/fsw, t=0..0.01) / (0.01 * Bcore_avg)
+        """
+        b_target = spec.B_max_target
+        # Average voltage-time product over half line cycle
+        v_d_product = op.vac_t * op.duty_t
+        v_s_per_cycle = np.trapezoid(v_d_product, op.t) / spec.fsw
+        half_period = 0.5 / spec.f_line
+        return v_s_per_cycle / (half_period * b_target) * 1e4  # m²→cm²
+
+    def _select_core(self, spec: DesignSpec, op: OperatingPoint,
+                     L_uh: float) -> CoreSpec:
+        ae_n = self._required_ae_n(spec, op)
+        ae_min = ae_n / 60  # assume ~60 turns
+
+        candidates = self.db.query(
+            material_class=spec.core_material_pref,
+            ae_min_cm2=ae_min * 0.5,
+            max_results=20
+        )
+
+        if not candidates:
+            candidates = self.db.query(max_results=10)
+
+        if not candidates:
+            raise ValueError("No suitable core found in database")
+
+        # Prefer ~35.8mm OD Sendust (Mathcad reference)
+        for c in candidates:
+            if 33 <= c.od_mm <= 37 and c.material_class == spec.core_material_pref:
+                return c
+        return candidates[0]
+
+    def _select_wire(self, spec: DesignSpec, op: OperatingPoint,
+                     n_turns: float) -> tuple[float, int]:
+        a_cu_mm2 = op.iin_rms / spec.J_max
+        std_diameters = [0.8, 1.0, 1.2, 1.5, 1.8, 2.0]
+        for d in std_diameters:
+            a_wire = np.pi * (d / 2) ** 2
+            n_par = max(1, int(np.ceil(a_cu_mm2 / a_wire)))
+            if n_par <= 4:
+                return d, n_par
+        return 2.0, max(1, int(np.ceil(a_cu_mm2 / (np.pi * 1.0 ** 2))))
+
+
+class InductorLoss:
+    """Computes inductor losses: core + copper."""
+
+    def __init__(self, db: CoreDatabase | None = None):
+        self.db = db or CoreDatabase()
+
+    def compute(self, design: InductorDesign, spec: DesignSpec,
+                op: OperatingPoint) -> LossResult:
+        core = design.core
+        n_cores = design.n_cores
+        ae_total = core.ae_cm2 * n_cores
+        ve_total = core.ve_cm3 * n_cores
+
+        p_fe = self._core_loss(design, spec, op)
+        p_cu = self._copper_loss(design, spec, op)
+
+        b_max = calculate_b_max(design.L_eff_at_ipeak_uh, op.iin_peak,
+                                design.n_turns, ae_total)
+
+        return LossResult(
+            component="Inductor (per phase)",
+            power_loss_W=p_fe + p_cu,
+            sub_losses={"core": p_fe, "copper": p_cu},
+            metadata={
+                "core_part": core.part_number,
+                "core_material": core.material,
+                "n_cores": n_cores,
+                "turns": design.n_turns,
+                "L_target_uH": design.L_target_uh,
+                "L_noload_uH": design.L_noload_uh,
+                "L_eff_uH": design.L_eff_at_ipeak_uh,
+                "B_max_T": b_max,
+                "saturation_pct": (design.L_eff_at_ipeak_uh / design.L_noload_uh * 100
+                                   if design.L_noload_uh > 0 else 0),
+                "window_fill": design.kw,
+            }
+        )
+
+    def _core_loss(self, design: InductorDesign, spec: DesignSpec,
+                   op: OperatingPoint) -> float:
+        core = design.core
+        ae_total = core.ae_cm2 * design.n_cores
+        ve_total = core.ve_cm3 * design.n_cores
+
+        # AC flux swing at line peak
+        vac_peak = op.vm
+        d_peak = 1.0 - vac_peak / spec.vout
+        delta_i = vac_peak * d_peak / (design.L_eff_at_ipeak_uh * UH_TO_H * spec.fsw)
+        b_ac = calculate_b_ac(design.L_eff_at_ipeak_uh, delta_i,
+                              design.n_turns, ae_total)
+
+        # Try Steinmetz (iGSE)
+        st = self.db.get_steinmetz(core.material)
+        if st is None:
+            st = self.db.get_steinmetz(core.material_class)
+
+        if st is not None and b_ac > 0:
+            ve_m3 = ve_total * 1e-6
+            return st.core_loss(spec.fsw, b_ac, ve_m3, method='igse', duty=d_peak)
+
+        # Fallback: Mathcad empirical formula
+        b_avg_gauss = calculate_b_max(design.L_eff_at_ipeak_uh,
+                                      op.iin_peak * 2 / np.pi,
+                                      design.n_turns, ae_total) * 1e4
+        pv_W_cm3 = 3.89e-3 * (b_avg_gauss / 1000) ** 2.57 * (spec.fsw / 1000) ** 1.11
+        return float(pv_W_cm3 * ve_total)
+
+    def _copper_loss(self, design: InductorDesign, spec: DesignSpec,
+                     op: OperatingPoint) -> float:
+        core = design.core
+
+        a_wire_mm2 = np.pi * (design.wire_d_mm / 2) ** 2 * design.n_parallel
+        a_wire_m2 = a_wire_mm2 * 1e-6
+
+        mlt_m = core.mlt_cm / 100
+        total_length_m = design.n_turns * mlt_m
+
+        rho = rho_cu(60.0)
+        rdc = dc_resistance(rho, total_length_m, a_wire_m2)
+
+        delta = skin_depth(spec.fsw, 60.0)
+        f_skin = skin_effect_factor(design.wire_d_mm / 1000, delta)
+
+        return float(op.iin_rms ** 2 * rdc * f_skin)
