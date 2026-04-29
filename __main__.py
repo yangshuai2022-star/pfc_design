@@ -1,0 +1,344 @@
+"""CLI entry point for PFC Design Calculator."""
+
+import os
+import subprocess
+import click
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
+from .core.spec import DesignSpec, MosfetDatabase
+from .core.operating_point import compute_mathcad_operating_point
+from .magnetics.core_database import CoreDatabase
+from .models.system import SystemAnalyzer
+from .optimization.sweep import ParamSweep
+
+
+@click.group()
+def cli():
+    """PFC Design Calculator - Two-phase interleaved PFC design tool."""
+    pass
+
+
+@cli.command()
+@click.option("--vin", default=176.0, help="Minimum input voltage (Vrms)")
+@click.option("--vout", default=410.0, help="Output voltage (Vdc)")
+@click.option("--pout", default=7100.0, help="Total output power (W)")
+@click.option("--fsw", default=65000.0, help="Switching frequency (Hz)")
+@click.option("--ripple", default=1.0, help="Current ripple ratio")
+@click.option("--core", default=None, help="Preferred core part number")
+@click.option("--mosfet", default=None, help="Preferred MOSFET part number")
+@click.option("--n-cores", default=2, help="Number of stacked cores")
+@click.option("--plot/--no-plot", default=True, help="Generate plots")
+@click.option("--save-plot", default=None, help="Save plots to directory")
+def run(vin, vout, pout, fsw, ripple, core, mosfet, n_cores, plot, save_plot):
+    """Single-point PFC design analysis with plots."""
+    spec = DesignSpec(vin_min=vin, vout=vout, pout_total=pout, fsw=fsw, ripple_ratio=ripple)
+    db = CoreDatabase()
+    mdb = MosfetDatabase()
+
+    preferred_core = db.get_by_part_number(core) if core else None
+    preferred_mosfet = mdb.get(mosfet) if mosfet else None
+
+    if core and not preferred_core:
+        click.echo(f"Core '{core}' not found, auto-selecting.")
+    if mosfet and not preferred_mosfet:
+        click.echo(f"MOSFET '{mosfet}' not found, auto-selecting.")
+
+    analyzer = SystemAnalyzer(db)
+    result = analyzer.analyze(spec, preferred_core=preferred_core, mosfet=preferred_mosfet, n_cores=n_cores)
+
+    _print_summary(result)
+    _print_loss_table(result)
+
+    if plot:
+        if save_plot is None:
+            save_plot = os.path.join(os.path.expanduser("~"), "pfc_design", "output")
+        _generate_plots(result, save_plot)
+
+
+@cli.command()
+@click.option("--vin", default=176.0, help="Min input voltage (Vrms)")
+@click.option("--vout", default=410.0, help="Output voltage (Vdc)")
+@click.option("--pout", default=7100.0, help="Total output power (W)")
+@click.option("--fsw", default=0.0, help="Fixed switching freq (kHz). If set, fsw is not swept.")
+@click.option("--fsw-start", default=45.0, help="fsw sweep start (kHz)")
+@click.option("--fsw-stop", default=120.0, help="fsw sweep stop (kHz)")
+@click.option("--fsw-step", default=10.0, help="fsw sweep step (kHz)")
+@click.option("--ripple-start", default=0.15, help="Ripple ratio start")
+@click.option("--ripple-stop", default=0.50, help="Ripple ratio stop")
+@click.option("--ripple-n", default=6, help="Ripple ratio points")
+@click.option("--tech", default="Si", help="MOSFET technology filter (Si/SiC/Si CoolMOS/Si SuperJunction/GaN/all)")
+@click.option("--core-material", default="Sendust", help="Core material class filter")
+@click.option("--core-limit", default=10, help="Maximum number of core candidates")
+@click.option("--n-cores", default=2, help="Stacked cores")
+@click.option("--top", default=10, help="Show top N results")
+@click.option("--csv", default=None, help="Save full sweep results to CSV")
+def optimize(vin, vout, pout, fsw, fsw_start, fsw_stop, fsw_step,
+             ripple_start, ripple_stop, ripple_n, tech, core_material,
+             core_limit, n_cores, top, csv):
+    """Sweep optimization: ripple x core x MOSFET (fsw optional sweep)."""
+    spec = DesignSpec(vin_min=vin, vout=vout, pout_total=pout)
+
+    db = CoreDatabase()
+    mdb = MosfetDatabase()
+    cores = db.top_for_pfc(ae_min_cm2=0.5, material_class=core_material, n=core_limit)
+    mosfets = mdb.query(vds_min=spec.vout * 1.25, technology=tech)
+
+    # Fixed or swept fsw
+    if fsw > 0:
+        fsw_arr = np.array([fsw * 1000])
+        fsw_label = f"fsw: {fsw}kHz (fixed)"
+    else:
+        fsw_arr = np.arange(fsw_start * 1000, (fsw_stop + fsw_step/2) * 1000, fsw_step * 1000)
+        fsw_label = f"fsw: {fsw_start}-{fsw_stop}kHz"
+
+    if len(mosfets) == 0:
+        click.echo(f"No MOSFETs found for '{tech}' with Vds > {spec.vout*1.25:.0f}V. Try --tech all")
+        return
+    if len(cores) == 0:
+        click.echo(f"No cores found for material '{core_material}'. Try --core-material Sendust or --core-material all is not supported yet.")
+        return
+
+    click.echo(f"\n{'='*75}")
+    click.echo(f"  PFC Optimization Sweep")
+    click.echo(f"  {fsw_label} / ripple: {ripple_start}-{ripple_stop}")
+    click.echo(f"  Cores: {len(cores)} ({core_material})  |  MOSFETs: {len(mosfets)} ({tech})")
+    click.echo(f"{'='*75}")
+
+    sweep_vars = {
+        "fsw": fsw_arr,
+        "ripple_ratio": np.linspace(ripple_start, ripple_stop, int(ripple_n)),
+        "core_idx": list(range(len(cores))),
+        "mosfet_idx": list(range(len(mosfets))),
+    }
+
+    click.echo(f"Total points: {np.prod([len(v) for v in sweep_vars.values()]):.0f}")
+    click.echo("Running sweep...")
+
+    sweeper = ParamSweep(db)
+    df = sweeper.sweep(spec, sweep_vars, n_cores=n_cores, cores=cores, mosfets=mosfets)
+    if csv:
+        csv_dir = os.path.dirname(os.path.abspath(csv))
+        if csv_dir:
+            os.makedirs(csv_dir, exist_ok=True)
+        df.to_csv(csv, index=False)
+        click.echo(f"Full sweep CSV saved: {csv}")
+
+    feasible = df[df["feasible"]]
+    click.echo(f"\nResults: {len(df)} total, {len(feasible)} feasible\n")
+
+    if len(feasible) > 0:
+        top_n = feasible.nsmallest(top, "P_total_W")
+
+        # --- Comparison Table ---
+        click.echo(f"{'Rank':<5} {'fsw':>5} {'r':>5} {'Core':<22} {'MOSFET':<25} {'Lpk':>6} {'Bmax':>6} {'kw':>5} {'P_ind':>7} {'P_mos':>7} {'P_dio':>7} {'P_total':>8} {'eta':>6}")
+        click.echo("-" * 130)
+        for i, (_, row) in enumerate(top_n.iterrows()):
+            click.echo(
+                f"#{i+1:<4} {row['fsw_kHz']:>4.0f}k {row['ripple_ratio']:>.2f} "
+                f"{row['core']:<22} {row['mosfet']:<25} "
+                f"{row['L_eff_uH']:>5.0f}uH {row['B_max_T']:>5.3f}T {row['kw']*100:>4.0f}% "
+                f"{row['P_ind_W']:>6.1f}W {row['P_mosfet_W']:>6.1f}W "
+                f"{row['P_diode_W']:>6.1f}W {row['P_total_W']:>7.1f}W "
+                f"{row['efficiency_pct']:>5.2f}%"
+            )
+
+        # Best design detail
+        best = top_n.iloc[0]
+        click.echo(f"\n+-- Best Design ------------------------------------+")
+        click.echo(f"| fsw={best['fsw_kHz']:.0f}kHz  ripple={best['ripple_ratio']:.2f}  "
+                   f"eta={best['efficiency_pct']:.2f}%")
+        click.echo(f"| Core:  {best['core']} ({best['core_material']})")
+        click.echo(f"| MOSFET: {best['mosfet']} ({best['mosfet_tech']}, "
+                   f"Rds={best['mosfet_Rds25']:.0f}mOhm)")
+        click.echo(f"| N={best['turns']:.0f}  L_eff={best['L_eff_uH']:.0f}uH  "
+                   f"Bmax={best['B_max_T']:.3f}T  sat={best['sat_pct']:.0f}%")
+        click.echo(f"| Wire: {best['wire_d_mm']:.1f}mm x{best['n_parallel']:.0f}  "
+                   f"kw={best['kw']*100:.1f}%")
+        click.echo(f"| P_ind={best['P_ind_W']:.1f}W  P_mos={best['P_mosfet_W']:.1f}W  "
+                   f"P_dio={best['P_diode_W']:.1f}W  P_br={best['P_bridge_W']:.1f}W")
+        click.echo(f"| Inductor: core={best['P_ind_core_W']:.1f}W  copper={best['P_ind_copper_W']:.1f}W")
+        click.echo(f"| MOSFET: cond={best['P_mosfet_cond_W']:.1f}W  sw={best['P_mosfet_sw_W']:.1f}W  "
+                   f"Coss={best['P_mosfet_coss_W']:.1f}W  gate={best['P_mosfet_gate_W']:.1f}W")
+        click.echo(f"| Diode: fwd={best['P_diode_fwd_W']:.1f}W  rr={best['P_diode_rr_W']:.1f}W  "
+                   f"Cap={best['P_cap_W']:.1f}W")
+        click.echo(f"+---------------------------------------------------+")
+
+        # --- Efficiency Plateau Plot ---
+        _plot_efficiency_plateau(feasible)
+    else:
+        failed = df["constraints"].value_counts().head(5)
+        click.echo("No feasible design found. Top constraint reasons:")
+        for reason, count in failed.items():
+            click.echo(f"  {count:>4}  {reason}")
+
+
+@cli.command()
+@click.option("--material", default="Sendust", help="Material class")
+def cores(material):
+    """List available magnetic cores."""
+    db = CoreDatabase()
+    results = db.query(material_class=material, max_results=50)
+    click.echo(f"\n{'Part Number':<25} {'Material':<20} {'OD':>5} {'Ae':>5} {'AL':>6} {'Aw':>5}")
+    click.echo("-" * 72)
+    for c in results:
+        click.echo(f"{c.part_number:<25} {c.material:<20} {c.od_mm:>4.1f}mm "
+                   f"{c.ae_cm2:>4.2f}cm {c.al_nH_per_t2:>5.0f}  {c.aw_cm2:>4.2f}cm")
+
+
+@cli.command()
+@click.option("--tech", default="Si", help="Technology filter (Si/SiC/Si CoolMOS/Si SuperJunction/GaN/all)")
+def mosfets(tech):
+    """List available MOSFETs."""
+    mdb = MosfetDatabase()
+    results = mdb.query(technology=tech)
+    click.echo(f"\n{'Part Number':<22} {'Tech':<16} {'Vds':>5} {'Id25':>5} {'Rds':>6} {'Qg':>5} {'Price':>6}")
+    click.echo("-" * 72)
+    for m in results:
+        click.echo(f"{m.part_number:<22} {m.technology:<16} {m.vds_max:>4.0f}V {m.id_25c:>4.0f}A "
+                   f"{m.rds_on_25c*1000:>4.0f}mΩ {m.qg_nc:>4.0f}nC ${m.price_usd:>5.1f}")
+
+
+@cli.command()
+def version():
+    """Show version."""
+    from . import __version__
+    click.echo(f"pfc_design v{__version__}")
+
+
+# ─── Output helpers ────────────────────────────────────────────
+
+def _print_summary(result):
+    spec = result["spec"]
+    design = result["inductor_design"]
+    mos = result["mosfet"]
+    click.echo(f"\n=== PFC Design Summary ===")
+    click.echo(f"{spec.vin_min}-{spec.vin_max}V → {spec.vout}V | "
+               f"{spec.pout_total/1000:.1f}kW | fsw={spec.fsw/1000:.0f}kHz | ripple r={spec.ripple_ratio:.2f}")
+    click.echo(f"Core: {design.core.part_number} x{design.n_cores} | "
+               f"N={design.n_turns} | L_eff={design.L_eff_at_ipeak_uh:.0f}uH")
+    click.echo(f"MOSFET: {mos.part_number} ({mos.technology}) | "
+               f"Rds25={mos.rds_on_25c*1000:.0f}mΩ | Vds={mos.vds_max:.0f}V")
+    click.echo(f"Wire: {design.wire_d_mm}mm x{design.n_parallel} | Window fill: {design.kw*100:.1f}%")
+
+
+def _print_loss_table(result):
+    click.echo(f"\n{'Component':<25} {'Loss (W)':>8}  {'%':>6}")
+    click.echo("-" * 42)
+    total = result["total_loss"]
+    for name, val in result["breakdown"].items():
+        if val > 0.3:
+            click.echo(f"{name:<25} {val:>7.1f}W {val/total*100:>5.1f}%")
+    click.echo("-" * 42)
+    click.echo(f"{'TOTAL':<25} {total:>7.1f}W {'100.0%':>6}")
+    click.echo(f"{'Efficiency':<25} {result['efficiency']*100:>7.2f}%")
+
+
+def _generate_plots(result, save_dir):
+    os.makedirs(save_dir, exist_ok=True)
+    spec = result["spec"]
+    op = result["op"]
+    design = result["inductor_design"]
+    core = design.core
+
+    # --- Loss Pie Chart ---
+    fig, ax = plt.subplots(figsize=(10, 7))
+    items = {k: v for k, v in result["breakdown"].items() if v > result["total_loss"] * 0.005}
+    colors = plt.cm.Set3(np.linspace(0, 1, len(items)))
+    wedges, _, autotexts = ax.pie(
+        list(items.values()), labels=None, autopct='%1.1f%%',
+        startangle=90, pctdistance=0.82, colors=colors,
+        wedgeprops=dict(width=0.35, edgecolor='w')
+    )
+    for t in autotexts:
+        t.set_fontsize(9)
+        t.set_fontweight('bold')
+    legend_labels = [f"{l}: {s:.1f}W" for l, s in items.items()]
+    ax.legend(wedges, legend_labels, title="Components",
+              loc="center left", bbox_to_anchor=(1, 0, 0.5, 1), fontsize=8)
+    ax.text(0, 0, f"η={result['efficiency']*100:.1f}%\n{result['total_loss']:.1f}W",
+            ha='center', va='center', fontsize=13, fontweight='bold')
+    ax.set_title("PFC Loss Breakdown", fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    f1 = os.path.join(save_dir, "loss_pie.png")
+    plt.savefig(f1, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+
+    # --- L vs I Saturation ---
+    from .magnetics.saturation import generate_L_vs_I
+    i_arr, L_arr = generate_L_vs_I(
+        design.L_noload_uh, design.n_turns, core.le_cm,
+        core.dc_bias_coeffs, max(50, op.iin_peak * 2)
+    )
+    fig2, ax2 = plt.subplots(figsize=(8, 5))
+    ax2.plot(i_arr, L_arr, 'b-', linewidth=2)
+    ax2.axvline(x=op.iin_rms, color='g', linestyle='--', label=f'Irms={op.iin_rms:.1f}A')
+    ax2.axvline(x=op.iin_peak, color='r', linestyle='--', label=f'Ipeak={op.iin_peak:.1f}A')
+    ax2.axhline(y=design.L_target_uh, color='orange', linestyle=':', label=f'L_tgt={design.L_target_uh:.0f}uH')
+    ax2.set_xlabel("DC Current (A)")
+    ax2.set_ylabel("Inductance (μH)")
+    ax2.set_title(f"L vs DC Bias (L₀={design.L_noload_uh:.0f}μH, N={design.n_turns})")
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    plt.tight_layout()
+    f2 = os.path.join(save_dir, "L_vs_I.png")
+    plt.savefig(f2, dpi=150, bbox_inches='tight')
+    plt.close(fig2)
+
+    click.echo(f"\nPlots saved: {f1}, {f2}")
+
+    # Auto-open in Windows
+    if os.name != 'nt':
+        win_path = save_dir.replace(os.path.expanduser("~"), "\\\\wsl$\\Ubuntu\\home\\yangs")
+        subprocess.run(["explorer.exe", win_path], capture_output=True)
+    else:
+        subprocess.run(["explorer.exe", save_dir], capture_output=True)
+
+
+def _plot_efficiency_plateau(df_feasible):
+    """Efficiency vs switching frequency scatter, highlighting top designs."""
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    # Scatter all feasible points
+    sc = ax.scatter(
+        df_feasible["fsw_kHz"], df_feasible["efficiency_pct"],
+        c=df_feasible["P_total_W"], cmap="RdYlGn_r",
+        s=60, alpha=0.6, edgecolors='grey', linewidth=0.3
+    )
+    cbar = plt.colorbar(sc)
+    cbar.set_label("Total Loss (W)")
+
+    # Highlight top 5
+    top5 = df_feasible.nsmallest(5, "P_total_W")
+    ax.scatter(top5["fsw_kHz"], top5["efficiency_pct"],
+               c='red', s=120, marker='*', edgecolors='darkred',
+               zorder=10, label=f'Top 5')
+
+    # Labels for top 3
+    for _, row in top5.head(3).iterrows():
+        ax.annotate(
+            f"{row['mosfet'][:12]}\n{row['core'][:12]}",
+            (row["fsw_kHz"], row["efficiency_pct"]),
+            fontsize=7, ha='center', va='bottom',
+            bbox=dict(boxstyle='round,pad=0.2', facecolor='yellow', alpha=0.7)
+        )
+
+    ax.set_xlabel("Switching Frequency (kHz)")
+    ax.set_ylabel("Efficiency (%)")
+    ax.set_title("PFC Efficiency Plateau — fsw × ripple × core × MOSFET sweep")
+    ax.legend(loc='lower right')
+    ax.grid(True, alpha=0.3)
+
+    save_dir = os.path.join(os.path.expanduser("~"), "pfc_design", "output")
+    os.makedirs(save_dir, exist_ok=True)
+    f = os.path.join(save_dir, "efficiency_plateau.png")
+    plt.tight_layout()
+    plt.savefig(f, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    click.echo(f"Efficiency plateau plot saved: {f}")
+
+
+if __name__ == "__main__":
+    cli()
