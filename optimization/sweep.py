@@ -179,11 +179,15 @@ class ParamSweep:
                     if not allow_aggressive_ripple else True,
                     "actual_ripple_margin": actual_ripple_margin,
                     "actual_ripple_margin_limit": actual_ripple_margin_limit,
-                    "actually_ripple_ratio_limit": actual_ripple_ratio_limit,
+                    "actual_ripple_ratio_limit": actual_ripple_ratio_limit,
                     "actual_ripple_ratio_peak_basis": actual_ripple_basis,
                     "actual_ripple_risk_level": actual_ripple_risk,
                     "L_eff_ratio": L_eff_ratio,
                     "target_ripple_ratio": spec.ripple_ratio,
+                    "failed_bmax": b_max > core.bs_T * 0.7,
+                    "failed_window": design.kw > 0.6,
+                    "failed_saturation": sat_pct < 20,
+                    "failed_actual_ripple": not feasible_by_actual_ripple,
                 })
             except Exception as e:
                 results.append({
@@ -208,11 +212,15 @@ class ParamSweep:
                     "feasible_by_actual_ripple": False,
                     "actual_ripple_margin": 0.0,
                     "actual_ripple_margin_limit": actual_ripple_margin_limit,
-                    "actually_ripple_ratio_limit": actual_ripple_ratio_limit,
+                    "actual_ripple_ratio_limit": actual_ripple_ratio_limit,
                     "actual_ripple_ratio_peak_basis": 0.0,
                     "actual_ripple_risk_level": "",
                     "L_eff_ratio": 0.0,
                     "target_ripple_ratio": 0.0,
+                    "failed_bmax": True,
+                    "failed_window": True,
+                    "failed_saturation": True,
+                    "failed_actual_ripple": True,
                 })
 
         return pd.DataFrame(results)

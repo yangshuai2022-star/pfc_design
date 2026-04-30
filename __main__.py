@@ -13,6 +13,10 @@ from .core.operating_point import compute_mathcad_operating_point
 from .magnetics.core_database import CoreDatabase
 from .models.system import SystemAnalyzer
 from .optimization.sweep import ParamSweep
+from .optimization.profile import (
+    classify_results, get_recommended_designs,
+    infeasible_reason_summary, per_core_best, per_mosfet_best,
+)
 
 
 @click.group()
@@ -81,11 +85,13 @@ def run(vin, vout, pout, fsw, ripple, core, mosfet, n_cores, plot, save_plot, tr
 @click.option("--n-cores", default=2, help="Stacked cores")
 @click.option("--allow-aggressive-ripple", is_flag=True, default=False,
               help="Allow designs with actual ripple exceeding limits (warning only)")
+@click.option("--diverse", is_flag=True, default=False,
+              help="Show per-core and per-MOSFET best candidates")
 @click.option("--top", default=10, help="Show top N results")
 @click.option("--csv", default=None, help="Save full sweep results to CSV")
 def optimize(vin, vout, pout, fsw, fsw_start, fsw_stop, fsw_step,
              ripple_start, ripple_stop, ripple_n, tech, core_material,
-             core_limit, n_cores, top, csv, allow_aggressive_ripple):
+             core_limit, n_cores, top, csv, allow_aggressive_ripple, diverse):
     """Sweep optimization: ripple x core x MOSFET (fsw optional sweep)."""
     spec = DesignSpec(vin_min=vin, vout=vout, pout_total=pout)
 
@@ -128,6 +134,11 @@ def optimize(vin, vout, pout, fsw, fsw_start, fsw_stop, fsw_step,
     sweeper = ParamSweep(db)
     df = sweeper.sweep(spec, sweep_vars, n_cores=n_cores, cores=cores, mosfets=mosfets,
                        allow_aggressive_ripple=allow_aggressive_ripple)
+
+    # --- Classify results ---
+    df = classify_results(df)
+    recommendations = get_recommended_designs(df)
+
     if csv:
         csv_dir = os.path.dirname(os.path.abspath(csv))
         if csv_dir:
@@ -136,7 +147,15 @@ def optimize(vin, vout, pout, fsw, fsw_start, fsw_stop, fsw_step,
         click.echo(f"Full sweep CSV saved: {csv}")
 
     feasible = df[df["feasible"]]
-    click.echo(f"\nResults: {len(df)} total, {len(feasible)} feasible\n")
+    n_prod = df["design_profile_feasible_production"].sum()
+    n_bal = df["design_profile_feasible_balanced"].sum()
+    n_agg = df["design_profile_feasible_aggressive"].sum()
+    click.echo(f"\nResults: {len(df)} total, "
+               f"{len(feasible)} feasible  "
+               f"[production:{n_prod}  balanced:{n_bal}  aggressive:{n_agg}]\n")
+
+    # --- Recommendations ---
+    _print_recommendations(recommendations)
 
     if len(feasible) > 0:
         top_n = feasible.nsmallest(top, "P_total_W")
@@ -144,21 +163,23 @@ def optimize(vin, vout, pout, fsw, fsw_start, fsw_stop, fsw_step,
         # --- Comparison Table ---
         click.echo(f"{'Rank':<5} {'fsw':>5} {'r_trg':>5} {'Core':<22} {'MOSFET':<22} "
                    f"{'Lpk':>6} {'Leff/L':>6} {'Bmax':>6} {'kw':>5} "
-                   f"{'Δr_m':>5} {'risk':>6} "
+                   f"{'Δr_m':>5} {'risk':>6} {'Rec':<12} "
                    f"{'P_tot':>7} {'eta':>6}")
-        click.echo("-" * 132)
+        click.echo("-" * 145)
         for i, (_, row) in enumerate(top_n.iterrows()):
             L_eff_ratio = row.get("L_eff_ratio", 0)
             margin = row.get("actual_ripple_margin", 0)
             risk = row.get("actual_ripple_risk_level", "?")
             risk_short = {"ok": "ok", "warning": "warn",
                           "high_warning": "HIwrn", "high_risk": "HIrisk"}.get(risk, risk[:6])
+            rec = row.get("recommendation_class", "")
+            rec_short = (rec[:11] + "…") if len(rec) > 12 else rec
             click.echo(
                 f"#{i+1:<4} {row['fsw_kHz']:>4.0f}k {row['ripple_ratio']:>.2f}  "
                 f"{row['core']:<22} {row['mosfet']:<22} "
                 f"{row['L_eff_uH']:>5.0f}uH {L_eff_ratio:>4.2f}  "
                 f"{row['B_max_T']:>5.3f}T {row['kw']*100:>4.0f}% "
-                f"{margin:>5.2f} {risk_short:>6} "
+                f"{margin:>5.2f} {risk_short:>6} {rec_short:<12} "
                 f"{row['P_total_W']:>6.1f}W "
                 f"{row['efficiency_pct']:>5.2f}%"
             )
@@ -184,13 +205,14 @@ def optimize(vin, vout, pout, fsw, fsw_start, fsw_stop, fsw_step,
                    f"Cap={best['P_cap_W']:.1f}W")
         click.echo(f"+---------------------------------------------------+")
 
+        # --- Diversity ---
+        if diverse:
+            _print_diversity(df)
+
         # --- Efficiency Plateau Plot ---
         _plot_efficiency_plateau(feasible)
-    else:
-        failed = df["constraints"].value_counts().head(5)
-        click.echo("No feasible design found. Top constraint reasons:")
-        for reason, count in failed.items():
-            click.echo(f"  {count:>4}  {reason}")
+
+    _print_infeasible_summary(df)
 
 
 @cli.command()
@@ -496,6 +518,97 @@ def _plot_efficiency_plateau(df_feasible):
     plt.savefig(f, dpi=150, bbox_inches='tight')
     plt.close(fig)
     click.echo(f"Efficiency plateau plot saved: {f}")
+
+
+def _print_recommendations(recommendations):
+    """Print the four recommendation classes."""
+    rec_specs = [
+        ("lowest_loss_feasible", "Lowest Loss Feasible",
+         "None — no design passes base constraints"),
+        ("recommended_robust", "Recommended (Robust / Production)",
+         "None — no design meets production constraints"),
+        ("recommended_balanced", "Recommended (Balanced)",
+         "None — no design meets balanced constraints"),
+        ("aggressive_low_loss", "Aggressive Low-Loss",
+         "None — no design meets aggressive constraints"),
+    ]
+    click.echo("--- Recommendations ---")
+    for key, label, none_msg in rec_specs:
+        row = recommendations.get(key)
+        if row is not None:
+            risk = row.get("actual_ripple_risk_level", "?")
+            risk_short = {"ok": "ok", "warning": "warn",
+                          "high_warning": "HIwrn", "high_risk": "HIrisk"}.get(risk, risk[:6])
+            rec = row.get("recommendation_class", "")
+            click.echo(
+                f"  [{label}]  "
+                f"core={row['core']}  mosfet={row['mosfet']}  "
+                f"fsw={row['fsw_kHz']:.0f}kHz  "
+                f"eta={row['efficiency_pct']:.2f}%  "
+                f"P_total={row['P_total_W']:.1f}W  "
+                f"ripple_margin={row['actual_ripple_margin']:.2f} "
+                f"({risk_short})  "
+                f"class={rec}"
+            )
+        else:
+            click.echo(f"  [{label}]  {none_msg}")
+    click.echo()
+
+
+def _print_diversity(df):
+    """Print per-core and per-MOSFET best feasible candidates."""
+    core_best = per_core_best(df)
+    mos_best = per_mosfet_best(df)
+
+    if len(core_best) > 0:
+        click.echo("--- Per-Core Best ---")
+        for _, row in core_best.iterrows():
+            risk = row.get("actual_ripple_risk_level", "?")
+            risk_short = {"ok": "ok", "warning": "warn",
+                          "high_warning": "HIwrn", "high_risk": "HIrisk"}.get(risk, risk[:6])
+            click.echo(
+                f"  core={row['core']:<22}  "
+                f"mosfet={row['mosfet']:<22}  "
+                f"fsw={row['fsw_kHz']:.0f}kHz  "
+                f"P_total={row['P_total_W']:.1f}W  "
+                f"eta={row['efficiency_pct']:.2f}%  "
+                f"risk={risk_short}"
+            )
+        click.echo()
+
+    if len(mos_best) > 0:
+        click.echo("--- Per-MOSFET Best ---")
+        for _, row in mos_best.iterrows():
+            risk = row.get("actual_ripple_risk_level", "?")
+            risk_short = {"ok": "ok", "warning": "warn",
+                          "high_warning": "HIwrn", "high_risk": "HIrisk"}.get(risk, risk[:6])
+            click.echo(
+                f"  mosfet={row['mosfet']:<22}  "
+                f"core={row['core']:<22}  "
+                f"fsw={row['fsw_kHz']:.0f}kHz  "
+                f"P_total={row['P_total_W']:.1f}W  "
+                f"eta={row['efficiency_pct']:.2f}%  "
+                f"risk={risk_short}"
+            )
+        click.echo()
+
+
+def _print_infeasible_summary(df):
+    """Print infeasible-reason breakdown."""
+    summary = infeasible_reason_summary(df)
+    failed = df["constraints"].value_counts().head(5)
+    feasible_count = df["feasible"].sum()
+    if feasible_count == 0:
+        click.echo("No feasible design found.")
+    click.echo("\n--- Infeasible Reason Summary ---")
+    click.echo(f"  failed_bmax:            {summary['failed_bmax_count']}")
+    click.echo(f"  failed_window:          {summary['failed_window_count']}")
+    click.echo(f"  failed_saturation:      {summary['failed_saturation_count']}")
+    click.echo(f"  failed_actual_ripple:   {summary['failed_actual_ripple_count']}")
+    click.echo(f"  failed_l_eff_ratio:     {summary['failed_l_eff_ratio_count']}")
+    click.echo("\nTop constraint strings:")
+    for reason, count in failed.items():
+        click.echo(f"  {count:>4}  {reason}")
 
 
 if __name__ == "__main__":
