@@ -71,13 +71,35 @@ class SystemAnalyzer:
         target_ripple_peak_basis = spec.ripple_ratio
         actual_ripple_peak_basis = delta_i_pp_actual / trace.iin_pk_phase
         delta_i_pp_ref = dm.get("DeltaI_pp_ref", 0.0)
+
+        # Effective inductance ratio & ripple risk
+        L_eff_ratio = L_eff / design.L_target_uh if design.L_target_uh > 0 else 0.0
+        actual_ripple_margin = (
+            actual_ripple_peak_basis / target_ripple_peak_basis
+            if target_ripple_peak_basis > 0 else float('inf')
+        )
+        actual_ripple_exceeds_target = actual_ripple_margin > 1.0
+
+        if actual_ripple_margin <= 1.10:
+            ripple_risk_level = "ok"
+        elif actual_ripple_margin <= 1.25:
+            ripple_risk_level = "warning"
+        elif actual_ripple_margin <= 1.50:
+            ripple_risk_level = "high_warning"
+        else:
+            ripple_risk_level = "high_risk"
+
         inductor_metrics = {
             "L_target_uH": design.L_target_uh,
             "L_eff_at_ipeak_uH": L_eff,
+            "L_eff_ratio": L_eff_ratio,
             "target_ripple_ratio_peak_basis": target_ripple_peak_basis,
             "actual_ripple_ratio_peak_basis": actual_ripple_peak_basis,
             "delta_i_pp_ref_A": delta_i_pp_ref,
             "delta_i_pp_actual_A": delta_i_pp_actual,
+            "actual_ripple_margin": actual_ripple_margin,
+            "actual_ripple_exceeds_target": actual_ripple_exceeds_target,
+            "actual_ripple_risk_level": ripple_risk_level,
             "Iin_pk_phase_A": trace.iin_pk_phase,
             "trace_uses_L": "L_eff_at_ipeak_uh",
         }

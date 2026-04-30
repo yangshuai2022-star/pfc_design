@@ -103,6 +103,11 @@ class ParamSweep:
                     feasible = False
                     constraints.append(f"sat={sat_pct:.0f}%<20%")
 
+                # Actual ripple metrics (report-only, not a hard constraint yet)
+                im = result.get("inductor_metrics", {})
+                actual_ripple_margin = round(im.get("actual_ripple_margin", 0.0), 4)
+                actual_ripple_risk = im.get("actual_ripple_risk_level", "")
+
                 results.append({
                     "fsw_kHz": spec.fsw / 1000,
                     "ripple_ratio": spec.ripple_ratio,
@@ -137,6 +142,10 @@ class ParamSweep:
                     "efficiency_pct": result["efficiency"] * 100,
                     "feasible": feasible,
                     "constraints": "; ".join(constraints),
+                    "feasible_by_actual_ripple": True,       # reserved
+                    "actual_ripple_limit": 2.0,              # reserved placeholder
+                    "actual_ripple_margin": actual_ripple_margin,
+                    "actual_ripple_risk_level": actual_ripple_risk,
                 })
             except Exception as e:
                 results.append({
@@ -158,6 +167,10 @@ class ParamSweep:
                     "P_bridge_W": 0, "P_cap_W": 0,
                     "P_total_W": np.nan, "efficiency_pct": np.nan,
                     "feasible": False, "constraints": f"Error: {str(e)[:80]}",
+                    "feasible_by_actual_ripple": False,
+                    "actual_ripple_limit": 2.0,
+                    "actual_ripple_margin": 0.0,
+                    "actual_ripple_risk_level": "",
                 })
 
         return pd.DataFrame(results)

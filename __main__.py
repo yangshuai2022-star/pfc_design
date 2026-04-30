@@ -228,12 +228,16 @@ def _print_summary(result):
                f"N={design.n_turns} | L_eff={design.L_eff_at_ipeak_uh:.0f}uH")
     im = result.get("inductor_metrics", {})
     if im:
+        ratio = im.get("L_eff_ratio", 0)
+        margin = im.get("actual_ripple_margin", 0)
+        risk = im.get("actual_ripple_risk_level", "?")
         click.echo(f"L design: L_target={im.get('L_target_uH', 0):.0f}uH  "
-                   f"L_eff={im.get('L_eff_at_ipeak_uH', 0):.0f}uH "
-                   f"(trace用L_eff)")
+                   f"L_eff={im.get('L_eff_at_ipeak_uH', 0):.0f}uH  "
+                   f"L_eff/L={ratio:.2f}  (trace用L_eff)")
         click.echo(f"Ripple:   target r={im.get('target_ripple_ratio_peak_basis', 0):.3f}  "
                    f"actual r={im.get('actual_ripple_ratio_peak_basis', 0):.3f}  "
-                   f"(ΔIpp_ref={im.get('delta_i_pp_ref_A', 0):.2f}A  "
+                   f"margin={margin:.2f}  risk={risk}")
+        click.echo(f"          (ΔIpp_ref={im.get('delta_i_pp_ref_A', 0):.2f}A  "
                    f"ΔIpp_actual={im.get('delta_i_pp_actual_A', 0):.2f}A)")
     click.echo(f"MOSFET: {mos.part_number} ({mos.technology}) | "
                f"Rds25={mos.rds_on_25c*1000:.0f}mΩ | Vds={mos.vds_max:.0f}V")
