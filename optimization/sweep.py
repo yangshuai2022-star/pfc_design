@@ -23,7 +23,10 @@ class ParamSweep:
               sweep_vars: dict[str, np.ndarray],
               n_cores: int = 2,
               cores: list[CoreSpec] | None = None,
-              mosfets: list[MosfetSpec] | None = None) -> pd.DataFrame:
+              mosfets: list[MosfetSpec] | None = None,
+              actual_ripple_margin_limit: float = 1.50,
+              actual_ripple_ratio_limit: float = 0.50,
+              allow_aggressive_ripple: bool = False) -> pd.DataFrame:
         """Run 4D grid sweep: fsw × ripple × core × mosfet.
 
         Args:
@@ -37,6 +40,9 @@ class ParamSweep:
             n_cores: number of stacked cores
             cores: candidate core list, defaults to top Sendust PFC cores
             mosfets: candidate MOSFET list, defaults to all parts with enough Vds
+            actual_ripple_margin_limit: max actual/target ripple ratio (default 1.50)
+            actual_ripple_ratio_limit: max absolute ripple ratio (default 0.50)
+            allow_aggressive_ripple: if True, don't filter on ripple (warning only)
 
         Returns:
             DataFrame with one row per design point
@@ -103,10 +109,35 @@ class ParamSweep:
                     feasible = False
                     constraints.append(f"sat={sat_pct:.0f}%<20%")
 
-                # Actual ripple metrics (report-only, not a hard constraint yet)
+                # Actual ripple metrics
                 im = result.get("inductor_metrics", {})
                 actual_ripple_margin = round(im.get("actual_ripple_margin", 0.0), 4)
                 actual_ripple_risk = im.get("actual_ripple_risk_level", "")
+                actual_ripple_basis = round(im.get("actual_ripple_ratio_peak_basis", 0.0), 4)
+                L_eff_ratio = round(im.get("L_eff_ratio", 0.0), 4)
+
+                # Ripple constraint check
+                ripple_margin_exceeded = actual_ripple_margin > actual_ripple_margin_limit
+                ripple_ratio_exceeded = actual_ripple_basis > actual_ripple_ratio_limit
+                feasible_by_actual_ripple = not (ripple_margin_exceeded or ripple_ratio_exceeded)
+
+                if not feasible_by_actual_ripple:
+                    reasons = []
+                    if ripple_margin_exceeded:
+                        reasons.append(
+                            f"ripple_margin={actual_ripple_margin:.2f}"
+                            f">{actual_ripple_margin_limit:.2f}")
+                    if ripple_ratio_exceeded:
+                        reasons.append(
+                            f"ripple_ratio={actual_ripple_basis:.3f}"
+                            f">{actual_ripple_ratio_limit:.3f}")
+                    if allow_aggressive_ripple:
+                        constraints.append(
+                            f"aggressive_ripple_warning: {'; '.join(reasons)}")
+                    else:
+                        feasible = False
+                        constraints.append(
+                            f"ripple_constraint: {'; '.join(reasons)}")
 
                 results.append({
                     "fsw_kHz": spec.fsw / 1000,
@@ -126,7 +157,9 @@ class ParamSweep:
                     "sat_pct": sat_pct,
                     "kw": design.kw,
                     "P_ind_core_W": losses["inductor"].sub_losses.get("core", 0.0),
-                    "P_ind_copper_W": losses["inductor"].sub_losses.get("copper", 0.0),
+                    "P_ind_copper_W": losses["inductor"].sub_losses.get("copper",
+                        losses["inductor"].sub_losses.get("copper_lf", 0.0)
+                        + losses["inductor"].sub_losses.get("copper_hf", 0.0)),
                     "P_ind_W": losses["inductor"].power_loss_W,
                     "P_mosfet_cond_W": losses["mosfet"].sub_losses.get("conduction", 0.0),
                     "P_mosfet_sw_W": losses["mosfet"].sub_losses.get("switching", 0.0),
@@ -142,10 +175,15 @@ class ParamSweep:
                     "efficiency_pct": result["efficiency"] * 100,
                     "feasible": feasible,
                     "constraints": "; ".join(constraints),
-                    "feasible_by_actual_ripple": True,       # reserved
-                    "actual_ripple_limit": 2.0,              # reserved placeholder
+                    "feasible_by_actual_ripple": feasible_by_actual_ripple
+                    if not allow_aggressive_ripple else True,
                     "actual_ripple_margin": actual_ripple_margin,
+                    "actual_ripple_margin_limit": actual_ripple_margin_limit,
+                    "actually_ripple_ratio_limit": actual_ripple_ratio_limit,
+                    "actual_ripple_ratio_peak_basis": actual_ripple_basis,
                     "actual_ripple_risk_level": actual_ripple_risk,
+                    "L_eff_ratio": L_eff_ratio,
+                    "target_ripple_ratio": spec.ripple_ratio,
                 })
             except Exception as e:
                 results.append({
@@ -168,9 +206,13 @@ class ParamSweep:
                     "P_total_W": np.nan, "efficiency_pct": np.nan,
                     "feasible": False, "constraints": f"Error: {str(e)[:80]}",
                     "feasible_by_actual_ripple": False,
-                    "actual_ripple_limit": 2.0,
                     "actual_ripple_margin": 0.0,
+                    "actual_ripple_margin_limit": actual_ripple_margin_limit,
+                    "actually_ripple_ratio_limit": actual_ripple_ratio_limit,
+                    "actual_ripple_ratio_peak_basis": 0.0,
                     "actual_ripple_risk_level": "",
+                    "L_eff_ratio": 0.0,
+                    "target_ripple_ratio": 0.0,
                 })
 
         return pd.DataFrame(results)

@@ -79,11 +79,13 @@ def run(vin, vout, pout, fsw, ripple, core, mosfet, n_cores, plot, save_plot, tr
 @click.option("--core-material", default="Sendust", help="Core material class filter")
 @click.option("--core-limit", default=10, help="Maximum number of core candidates")
 @click.option("--n-cores", default=2, help="Stacked cores")
+@click.option("--allow-aggressive-ripple", is_flag=True, default=False,
+              help="Allow designs with actual ripple exceeding limits (warning only)")
 @click.option("--top", default=10, help="Show top N results")
 @click.option("--csv", default=None, help="Save full sweep results to CSV")
 def optimize(vin, vout, pout, fsw, fsw_start, fsw_stop, fsw_step,
              ripple_start, ripple_stop, ripple_n, tech, core_material,
-             core_limit, n_cores, top, csv):
+             core_limit, n_cores, top, csv, allow_aggressive_ripple):
     """Sweep optimization: ripple x core x MOSFET (fsw optional sweep)."""
     spec = DesignSpec(vin_min=vin, vout=vout, pout_total=pout)
 
@@ -124,7 +126,8 @@ def optimize(vin, vout, pout, fsw, fsw_start, fsw_stop, fsw_step,
     click.echo("Running sweep...")
 
     sweeper = ParamSweep(db)
-    df = sweeper.sweep(spec, sweep_vars, n_cores=n_cores, cores=cores, mosfets=mosfets)
+    df = sweeper.sweep(spec, sweep_vars, n_cores=n_cores, cores=cores, mosfets=mosfets,
+                       allow_aggressive_ripple=allow_aggressive_ripple)
     if csv:
         csv_dir = os.path.dirname(os.path.abspath(csv))
         if csv_dir:
@@ -139,15 +142,24 @@ def optimize(vin, vout, pout, fsw, fsw_start, fsw_stop, fsw_step,
         top_n = feasible.nsmallest(top, "P_total_W")
 
         # --- Comparison Table ---
-        click.echo(f"{'Rank':<5} {'fsw':>5} {'r':>5} {'Core':<22} {'MOSFET':<25} {'Lpk':>6} {'Bmax':>6} {'kw':>5} {'P_ind':>7} {'P_mos':>7} {'P_dio':>7} {'P_total':>8} {'eta':>6}")
-        click.echo("-" * 130)
+        click.echo(f"{'Rank':<5} {'fsw':>5} {'r_trg':>5} {'Core':<22} {'MOSFET':<22} "
+                   f"{'Lpk':>6} {'Leff/L':>6} {'Bmax':>6} {'kw':>5} "
+                   f"{'Δr_m':>5} {'risk':>6} "
+                   f"{'P_tot':>7} {'eta':>6}")
+        click.echo("-" * 132)
         for i, (_, row) in enumerate(top_n.iterrows()):
+            L_eff_ratio = row.get("L_eff_ratio", 0)
+            margin = row.get("actual_ripple_margin", 0)
+            risk = row.get("actual_ripple_risk_level", "?")
+            risk_short = {"ok": "ok", "warning": "warn",
+                          "high_warning": "HIwrn", "high_risk": "HIrisk"}.get(risk, risk[:6])
             click.echo(
-                f"#{i+1:<4} {row['fsw_kHz']:>4.0f}k {row['ripple_ratio']:>.2f} "
-                f"{row['core']:<22} {row['mosfet']:<25} "
-                f"{row['L_eff_uH']:>5.0f}uH {row['B_max_T']:>5.3f}T {row['kw']*100:>4.0f}% "
-                f"{row['P_ind_W']:>6.1f}W {row['P_mosfet_W']:>6.1f}W "
-                f"{row['P_diode_W']:>6.1f}W {row['P_total_W']:>7.1f}W "
+                f"#{i+1:<4} {row['fsw_kHz']:>4.0f}k {row['ripple_ratio']:>.2f}  "
+                f"{row['core']:<22} {row['mosfet']:<22} "
+                f"{row['L_eff_uH']:>5.0f}uH {L_eff_ratio:>4.2f}  "
+                f"{row['B_max_T']:>5.3f}T {row['kw']*100:>4.0f}% "
+                f"{margin:>5.2f} {risk_short:>6} "
+                f"{row['P_total_W']:>6.1f}W "
                 f"{row['efficiency_pct']:>5.2f}%"
             )
 
