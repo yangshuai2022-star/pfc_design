@@ -6,10 +6,10 @@ Run with: python -m pytest pfc_design/tests/verify_mathcad.py -v
 import pytest
 import numpy as np
 
-from ..core.spec import DesignSpec, MosfetDatabase
-from ..core.operating_point import compute_mathcad_operating_point
-from ..magnetics.core_database import CoreDatabase
-from ..models.system import SystemAnalyzer
+from pfc_design.core.spec import DesignSpec, MosfetDatabase
+from pfc_design.core.operating_point import compute_mathcad_operating_point
+from pfc_design.magnetics.core_database import CoreDatabase
+from pfc_design.models.system import SystemAnalyzer
 
 
 @pytest.fixture
@@ -31,7 +31,7 @@ def mathcad_spec():
 @pytest.fixture
 def mathcad_mosfet():
     """Create a Mathcad-matching MOSFET (100mΩ, 650V)."""
-    from ..core.spec import MosfetSpec
+    from pfc_design.core.spec import MosfetSpec
     return MosfetSpec(
         manufacturer="Test", part_number="Mathcad-ref",
         technology="SiC", vds_max=650.0, id_25c=47.0, id_100c=30.0,
@@ -66,10 +66,16 @@ class TestOperatingPoint:
 
 class TestInductorDesign:
     def test_L_target(self, mathcad_spec, mathcad_op, mathcad_mosfet, db):
-        """Mathcad: L_pfc = 182.251 uH"""
+        """New boost inductor formula (~51 uH with r=1.0).
+
+        The DOC-corrected formula: L = Vin_pk * D_pk / (fsw * DeltaI_ref)
+        with ripple_ratio referenced to Iin_pk_phase gives ~50.6 uH.
+        The legacy formula (L = Vm / (r * fsw * Iin_rms)) gave ~182 uH
+        but was missing duty-cycle and had ambiguous ripple reference.
+        """
         analyzer = SystemAnalyzer(db)
         result = analyzer.analyze(mathcad_spec, mathcad_op, mosfet=mathcad_mosfet)
-        assert result["inductor_design"].L_target_uh == pytest.approx(182.25, rel=0.05)
+        assert result["inductor_design"].L_target_uh == pytest.approx(50.64, rel=0.05)
 
     def test_N_turns_reasonable(self, mathcad_spec, mathcad_op, mathcad_mosfet, db):
         """N around 45-80 turns for this core and L"""
@@ -87,14 +93,28 @@ class TestSystemEfficiency:
         assert 0.94 <= eta <= 0.99
 
     def test_total_loss_reasonable(self, mathcad_spec, mathcad_op, mathcad_mosfet, db):
-        """Total loss 80-300W for ~7kW PFC"""
+        """Total loss 80-400W for ~7kW PFC.
+
+        New L formula gives lower L (~51 uH vs ~182 uH), increasing ripple
+        and therefore losses. The bridge loss also doubled (corrected from
+        per-phase to total current basis). Combined effect pushes losses
+        higher but should stay under 400 W.
+        """
         analyzer = SystemAnalyzer(db)
         result = analyzer.analyze(mathcad_spec, mathcad_op, mosfet=mathcad_mosfet)
-        assert 80 <= result["total_loss"] <= 300
+        assert 80 <= result["total_loss"] <= 400
 
     def test_bridge_loss(self, mathcad_spec, mathcad_op, mathcad_mosfet, db):
-        """Mathcad: Pbridge = 37.833 W"""
+        """Bridge loss: ~75.7 W with corrected total-current basis.
+
+        The old Mathcad reference (37.83 W) used per-phase current
+        (op.iin_rms = 21 A) instead of total input current (~42 A).
+        Bridge is a shared component and must use total current.
+        Iin_rms_total = Pout/(eta*Vin) = 7100/(0.96*176) = 42.0 A.
+        Pbridge = 2 * Vf * Iin_abs_avg_total = 2 * 1.0 * (2/pi * sqrt(2) * 42.0)
+                ≈ 2 * 1.0 * 37.83 = 75.7 W.
+        """
         analyzer = SystemAnalyzer(db)
         result = analyzer.analyze(mathcad_spec, mathcad_op, mosfet=mathcad_mosfet)
         bridge = result["losses"]["bridge"].power_loss_W
-        assert bridge == pytest.approx(37.83, rel=0.10)
+        assert bridge == pytest.approx(75.67, rel=0.10)

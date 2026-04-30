@@ -16,7 +16,8 @@ class MosfetLoss:
 
     def compute(self, spec: DesignSpec, op: OperatingPoint,
                 mosfet: MosfetSpec | None = None,
-                t_j: float = 80.0) -> LossResult:
+                t_j: float = 80.0,
+                trace=None) -> LossResult:
         """Compute all MOSFET losses per switch.
 
         Args:
@@ -24,9 +25,7 @@ class MosfetLoss:
             op: operating point
             mosfet: MosfetSpec from database; uses spec defaults if None
             t_j: junction temperature in °C
-
-        Returns:
-            LossResult with sub-losses and part info in metadata
+            trace: optional LineCycleTrace for line-cycle-integrated loss
         """
         # Use MosfetSpec if provided, otherwise legacy spec fields
         if mosfet is not None:
@@ -55,8 +54,23 @@ class MosfetLoss:
         # Temperature-adjusted Rds_on
         rds_tj = rds_25 * (1 + rds_alpha * (t_j - 25))
 
-        p_cond = self._conduction_loss(op, rds_tj)
-        p_sw = self._switching_loss(spec, op, tr, tf)
+        if trace is not None:
+            p_cond = self._conduction_loss_line_cycle(trace, rds_tj)
+            p_sw = self._switching_loss_line_cycle(spec, trace, tr, tf)
+            loss_model = "line_cycle"
+            extra_meta = {
+                "coss_accounting_note": (
+                    "Simplified — if datasheet Eoff includes Coss energy, "
+                    "future versions must avoid double-counting"
+                ),
+                "risk_flag": "Coss/Eoff_overlap_risk",
+            }
+        else:
+            p_cond = self._conduction_loss_legacy(op, rds_tj)
+            p_sw = self._switching_loss_legacy(spec, op, tr, tf)
+            loss_model = "legacy_single_point"
+            extra_meta = {}
+
         p_coss = self._coss_loss(spec, coss_er)
         p_gate = self._gate_loss(spec, qg, vgs)
 
@@ -77,19 +91,54 @@ class MosfetLoss:
                 "vds_max": vds_max,
                 "Rds_on_Tj": rds_tj,
                 "T_j": t_j,
+                "loss_model": loss_model,
+                **extra_meta,
             }
         )
 
-    def _conduction_loss(self, op: OperatingPoint, rds: float) -> float:
+    # ── Legacy methods ──────────────────────────────────────────────
+
+    def _conduction_loss_legacy(self, op: OperatingPoint, rds: float) -> float:
         i_ds_rms = op.rms(op.iin_t, op.duty_t)
         return float(i_ds_rms ** 2 * rds)
 
-    def _switching_loss(self, spec: DesignSpec, op: OperatingPoint,
-                        tr: float, tf: float) -> float:
+    def _switching_loss_legacy(self, spec: DesignSpec, op: OperatingPoint,
+                               tr: float, tf: float) -> float:
         i_avg_on = 2 / np.pi * op.iin_peak
         e_on = 0.5 * spec.vout * i_avg_on * tr
         e_off = 0.5 * spec.vout * i_avg_on * tf
         return float(spec.fsw * (e_on + e_off))
+
+    # ── Line-cycle conduction loss (with ripple RMS) ────────────────
+
+    def _conduction_loss_line_cycle(self, trace, rds: float) -> float:
+        """Pcond = Rds * mean( D(theta) * [i_avg^2 + delta_i^2/12] ).
+
+        Degenerates to Rds * mean(D * i_avg^2) when delta_i = 0.
+        """
+        from ..core.line_cycle import average_over_half_cycle
+        integrand = trace.duty * trace.i_rms_local_sq
+        return float(rds * average_over_half_cycle(integrand, trace.theta))
+
+    # ── Line-cycle switching loss (valley/peak currents) ──────────
+
+    def _switching_loss_line_cycle(self, spec: DesignSpec, trace,
+                                   tr: float, tf: float) -> float:
+        """Psw = fsw * mean( Eon(theta) + Eoff(theta) ).
+
+        Boost CCM:  turn-on  current ≈ I_valley (valley of ripple)
+                    turn-off current ≈ I_peak   (peak of ripple)
+
+        Eon  = 0.5 * Vout * I_valley * tr
+        Eoff = 0.5 * Vout * I_peak   * tf
+        """
+        from ..core.line_cycle import average_over_half_cycle
+        e_on = 0.5 * spec.vout * trace.i_valley * tr
+        e_off = 0.5 * spec.vout * trace.i_peak * tf
+        e_mean = average_over_half_cycle(e_on + e_off, trace.theta)
+        return float(spec.fsw * e_mean)
+
+    # ── Coss / gate drive (unchanged by line-cycle) ─────────────────
 
     def _coss_loss(self, spec: DesignSpec, coss_er: float) -> float:
         e_oss = 0.5 * coss_er * spec.vout ** 2

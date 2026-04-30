@@ -16,7 +16,11 @@ from .base import LossResult
 
 
 class CapacitorBank:
-    """Output capacitor bank design and loss model."""
+    """Output capacitor bank design and loss model.
+
+    The capacitor is a shared component — all ripple calculations
+    use total output power (not per-phase).
+    """
 
     def compute(self, spec: DesignSpec, op: OperatingPoint) -> LossResult:
         """Compute capacitor bank losses and lifetime.
@@ -29,40 +33,47 @@ class CapacitorBank:
         f_line = spec.f_line
         vout = spec.vout
 
-        # Low-frequency voltage ripple (100/120 Hz)
-        # delta_V_pp = Iout / (2 * pi * f_line * C)  — simplified
-        # More accurate: delta_V_pp = Pout / (2 * pi * f_line * C * Vout)
-        delta_v_lf = spec.pout_per_phase / (2 * np.pi * f_line * c_total * vout)
+        # Low-frequency ripple current RMS (independent of C)
+        # For PFC output: Ic_lf_rms = Pout_total / (sqrt(2) * Vout)
+        ic_lf_rms = spec.pout_total / (np.sqrt(2) * vout)
 
-        # Switching-frequency ripple voltage
-        # delta_V_sw = delta_I / (8 * fsw * C)
-        # Use approximate delta_I
+        # Low-frequency voltage ripple pk-pk (depends on C)
+        # DeltaV_lf_pp = Pout_total / (2 * pi * f_line * C_total * Vout)
+        delta_v_lf = spec.pout_total / (2 * np.pi * f_line * c_total * vout)
+
+        # High-frequency switching ripple — simplified for v1
+        # Two-phase interleaving provides partial cancellation
         delta_i_sw = spec.ripple_ratio * op.iin_peak
         delta_v_sw = delta_i_sw / (8 * spec.fsw * c_total)
 
-        # RMS capacitor ripple current (2x line-frequency component)
-        # Ic_rms = Iout * sqrt((16*Vout)/(3*pi*Vm) - 1)  at Vin_min
-        ratio = (16 * vout) / (3 * np.pi * op.vm) - 1
-        ic_rms = op.iout * np.sqrt(max(0, ratio)) if ratio > 0 else op.iout * 0.5
+        # Total RMS capacitor current (approximate)
+        # For v1: use LF component as dominant
+        ic_rms = ic_lf_rms
 
-        # ESR power loss
+        # ESR power loss (LF-dominant for v1)
         p_esr = ic_rms ** 2 * esr_total
 
         # Capacitor lifetime estimation
         lifetime_hours = self._lifetime(spec, p_esr)
 
         return LossResult(
-            component="Output Capacitor",
+            component="Output Capacitor (total)",
             power_loss_W=float(p_esr),
             sub_losses={"ESR": float(p_esr)},
             metadata={
                 "C_total_uF": c_total * 1e6,
                 "ESR_total_Ohm": esr_total,
+                "Ic_lf_rms_A": ic_lf_rms,
                 "delta_V_LF_Vpp": delta_v_lf,
                 "delta_V_SW_Vpp": delta_v_sw,
                 "Ic_rms_A": ic_rms,
                 "lifetime_hours": lifetime_hours,
                 "lifetime_years": lifetime_hours / (365 * 24),
+                "power_basis": "pout_total",
+                "switching_ripple_model": "simplified",
+                "switching_ripple_warning": (
+                    "Two-phase interleaving HF ripple cancellation not yet modeled"
+                ),
             }
         )
 

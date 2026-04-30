@@ -101,7 +101,7 @@ class DesignSpec:
 
     # Switching
     fsw: float = 65_000.0
-    ripple_ratio: float = 1.0
+    ripple_ratio: float = 0.3
 
     # Target efficiency
     eta_target: float = 0.96
@@ -119,6 +119,7 @@ class DesignSpec:
 
     # Bridge rectifier
     bridge_vf: float = 1.0
+    bridge_rd: float = 0.0
 
     # Capacitor bank
     c_out_total: float = 1320e-6

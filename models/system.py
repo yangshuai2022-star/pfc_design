@@ -4,6 +4,7 @@ import numpy as np
 
 from ..core.spec import DesignSpec, MosfetSpec, MosfetDatabase
 from ..core.operating_point import OperatingPoint, compute_mathcad_operating_point
+from ..core.line_cycle import build_line_cycle_trace
 from ..magnetics.core_database import CoreDatabase
 from ..magnetics.core_entry import CoreSpec
 from .inductor import InductorDesigner, InductorLoss, InductorDesign
@@ -15,7 +16,7 @@ from .base import LossResult
 
 
 class SystemAnalyzer:
-    """Top-level system loss model."""
+    """Top-level system loss model with explicit per-phase / shared split."""
 
     def __init__(self, db: CoreDatabase | None = None):
         self.db = db or CoreDatabase()
@@ -55,47 +56,69 @@ class SystemAnalyzer:
             )
             mosfet = candidates[0] if candidates else self.mosfet_db.get("C3M0065100K")
 
-        # 1. Inductor
+        # 1. Inductor design
         design = self.inductor_designer.design(spec, op, preferred_core, n_cores)
-        ind_loss = self.inductor_loss.compute(design, spec, op)
 
-        # 2. MOSFET (with MosfetSpec)
-        mos_loss = self.mosfet_loss.compute(spec, op, mosfet=mosfet)
+        # 2. Build line-cycle trace using effective L at peak current
+        #    (accounts for DC bias saturation — the inductor's real operating point)
+        L_eff = design.L_eff_at_ipeak_uh
+        trace = build_line_cycle_trace(op, spec, L_eff)
 
-        # 3. Diode
-        dio_loss = self.diode_loss.compute(spec, op)
+        # 2a. Report actual ripple vs target ripple at line peak
+        idx_peak = np.argmin(np.abs(trace.theta - np.pi / 2))
+        delta_i_pp_actual = float(trace.delta_i_pp[idx_peak])
+        dm = design.design_metadata
+        target_ripple_peak_basis = spec.ripple_ratio
+        actual_ripple_peak_basis = delta_i_pp_actual / trace.iin_pk_phase
+        delta_i_pp_ref = dm.get("DeltaI_pp_ref", 0.0)
+        inductor_metrics = {
+            "L_target_uH": design.L_target_uh,
+            "L_eff_at_ipeak_uH": L_eff,
+            "target_ripple_ratio_peak_basis": target_ripple_peak_basis,
+            "actual_ripple_ratio_peak_basis": actual_ripple_peak_basis,
+            "delta_i_pp_ref_A": delta_i_pp_ref,
+            "delta_i_pp_actual_A": delta_i_pp_actual,
+            "Iin_pk_phase_A": trace.iin_pk_phase,
+            "trace_uses_L": "L_eff_at_ipeak_uh",
+        }
 
-        # 4. Bridge rectifier (shared)
+        # 3. Per-phase losses (line-cycle integrated)
+        ind_loss = self.inductor_loss.compute(design, spec, op, trace=trace)
+        mos_loss = self.mosfet_loss.compute(spec, op, mosfet=mosfet, trace=trace)
+        dio_loss = self.diode_loss.compute(spec, op, trace=trace)
+
+        # 4. Shared component losses
         br_loss = self.bridge_loss.compute(spec, op)
-
-        # 5. Capacitor bank (shared)
         cap_loss = self.capacitor.compute(spec, op)
 
-        # Aggregate
-        per_phase_loss = ind_loss.power_loss_W + mos_loss.power_loss_W + dio_loss.power_loss_W
-        total_loss = spec.n_phases * per_phase_loss + br_loss.power_loss_W + cap_loss.power_loss_W
+        # 5. Explicit aggregation
+        #    P_total = n_phases * (P_ind_phase + P_mos_phase + P_dio_phase)
+        #            + P_bridge_total + P_capacitor_total
+        n = spec.n_phases
+        p_per_phase = ind_loss.power_loss_W + mos_loss.power_loss_W + dio_loss.power_loss_W
+        p_shared = br_loss.power_loss_W + cap_loss.power_loss_W
+        total_loss = n * p_per_phase + p_shared
         efficiency = spec.pout_total / (spec.pout_total + total_loss)
 
-        # Breakdown
-        n = spec.n_phases
-        breakdown = {
-            "Inductor Core": n * ind_loss.sub_losses["core"],
-            "Inductor Copper": n * ind_loss.sub_losses["copper"],
-            "MOSFET Conduction": n * mos_loss.sub_losses["conduction"],
-            "MOSFET Switching": n * mos_loss.sub_losses["switching"],
-            "MOSFET Coss": n * mos_loss.sub_losses.get("Coss", 0),
-            "MOSFET Gate Drive": n * mos_loss.sub_losses.get("gate_drive", 0),
-            "Diode Forward": n * dio_loss.sub_losses["forward"],
-            "Diode RR": n * dio_loss.sub_losses.get("reverse_recovery", 0),
-            "Bridge Rectifier": br_loss.power_loss_W,
-            "Capacitor ESR": cap_loss.power_loss_W,
-        }
+        # Breakdown with explicit _per_phase / _total tags
+        breakdown = {}
+        for label, val in ind_loss.sub_losses.items():
+            breakdown[f"Inductor_{label}_per_phase"] = n * val
+        for label, val in mos_loss.sub_losses.items():
+            breakdown[f"MOSFET_{label}_per_phase"] = n * val
+        for label, val in dio_loss.sub_losses.items():
+            breakdown[f"Diode_{label}_per_phase"] = n * val
+        for label, val in br_loss.sub_losses.items():
+            breakdown[f"Bridge_{label}_total"] = val
+        for label, val in cap_loss.sub_losses.items():
+            breakdown[f"Capacitor_{label}_total"] = val
 
         return {
             "spec": spec,
             "op": op,
             "mosfet": mosfet,
             "inductor_design": design,
+            "inductor_metrics": inductor_metrics,
             "losses": {
                 "inductor": ind_loss,
                 "mosfet": mos_loss,
@@ -103,7 +126,9 @@ class SystemAnalyzer:
                 "bridge": br_loss,
                 "capacitor": cap_loss,
             },
-            "per_phase_loss": per_phase_loss,
+            "trace": trace,
+            "per_phase_loss": p_per_phase,
+            "shared_loss": p_shared,
             "total_loss": total_loss,
             "efficiency": efficiency,
             "breakdown": breakdown,

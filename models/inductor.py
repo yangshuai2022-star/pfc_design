@@ -22,7 +22,8 @@ class InductorDesign:
 
     def __init__(self, core: CoreSpec, n_turns: float, L_target_uh: float,
                  L_noload_uh: float, L_eff_at_ipeak_uh: float,
-                 wire_d_mm: float, n_parallel: int, n_cores: int = 1):
+                 wire_d_mm: float, n_parallel: int, n_cores: int = 1,
+                 design_metadata: dict | None = None):
         self.core = core
         self.n_turns = n_turns
         self.L_target_uh = L_target_uh
@@ -31,6 +32,7 @@ class InductorDesign:
         self.wire_d_mm = wire_d_mm
         self.n_parallel = n_parallel
         self.n_cores = n_cores
+        self.design_metadata = design_metadata or {}
 
     @property
     def kw(self) -> float:
@@ -65,6 +67,16 @@ class InductorDesigner:
         else:
             L_target_uh = self._calculate_L(spec, op)
 
+        # Intermediate values for metadata
+        vin_pk_min = np.sqrt(2) * op.vin_rms
+        d_pk = np.clip(1.0 - vin_pk_min / spec.vout, 0.05, 0.95)
+        iin_rms_phase = spec.pout_total / spec.n_phases / spec.eta_target / op.vin_rms
+        iin_pk_phase = np.sqrt(2) * iin_rms_phase
+        delta_i_ref = spec.ripple_ratio * iin_pk_phase
+
+        # IL_peak = line-frequency peak + half the switching ripple
+        il_peak = iin_pk_phase + delta_i_ref / 2.0
+
         # Step 2: Select core
         if preferred_core is not None:
             core = preferred_core
@@ -85,10 +97,10 @@ class InductorDesigner:
                                      core.le_cm, core.dc_bias_coeffs)
 
         # Step 6: Iterate to find stable design
-        # Check B_max with effective L at peak current
-        L_eff_peak = effective_inductance(L_noload_uh, n_turns, op.iin_peak,
+        # Check B_max with effective L at IL_peak (includes ripple)
+        L_eff_peak = effective_inductance(L_noload_uh, n_turns, il_peak,
                                           core.le_cm, core.dc_bias_coeffs)
-        b_peak = calculate_b_max(L_eff_peak, op.iin_peak, n_turns,
+        b_peak = calculate_b_max(L_eff_peak, il_peak, n_turns,
                                  core.ae_cm2 * n_cores)
         safe_b = core.bs_T * 0.7
         iterations = 0
@@ -96,11 +108,11 @@ class InductorDesigner:
             n_turns += 1
             al_total = core.al_nH_per_t2 * n_cores
             L_noload_uh = al_total * n_turns**2 / 1000
-            L_eff_peak = effective_inductance(L_noload_uh, n_turns, op.iin_peak,
+            L_eff_peak = effective_inductance(L_noload_uh, n_turns, il_peak,
                                               core.le_cm, core.dc_bias_coeffs)
             L_eff = effective_inductance(L_noload_uh, n_turns, op.iin_rms,
                                          core.le_cm, core.dc_bias_coeffs)
-            b_peak = calculate_b_max(L_eff_peak, op.iin_peak, n_turns,
+            b_peak = calculate_b_max(L_eff_peak, il_peak, n_turns,
                                      core.ae_cm2 * n_cores)
             iterations += 1
 
@@ -115,11 +127,31 @@ class InductorDesigner:
             wire_d_mm=wire_d_mm,
             n_parallel=n_parallel,
             n_cores=n_cores,
+            design_metadata={
+                "Vin_pk_min": vin_pk_min,
+                "D_at_line_peak": d_pk,
+                "Iin_rms_phase": iin_rms_phase,
+                "Iin_pk_phase": iin_pk_phase,
+                "IL_peak_with_ripple": il_peak,
+                "DeltaI_pp_ref": delta_i_ref,
+                "ripple_definition": "ripple_ratio = DeltaI_pp_at_line_peak / Iin_pk_phase",
+            },
         )
 
     def _calculate_L(self, spec: DesignSpec, op: OperatingPoint) -> float:
-        """L = Vm / (r * fsw * Iin_rms) — Mathcad design formula."""
-        return op.vm / (spec.ripple_ratio * spec.fsw * op.iin_rms) * 1e6
+        """Boost PFC inductor sizing formula.
+
+        L = Vin_pk_min * D_pk / (fsw * DeltaI_pp_ref)
+
+        where ripple_ratio = DeltaI_pp_at_line_peak / Iin_pk_phase.
+        """
+        vin_pk_min = np.sqrt(2) * op.vin_rms
+        d_pk = np.clip(1.0 - vin_pk_min / spec.vout, 0.05, 0.95)
+        iin_rms_phase = spec.pout_total / spec.n_phases / spec.eta_target / op.vin_rms
+        iin_pk_phase = np.sqrt(2) * iin_rms_phase
+        delta_i_ref = spec.ripple_ratio * iin_pk_phase
+        L_target_H = vin_pk_min * d_pk / (spec.fsw * delta_i_ref)
+        return L_target_H * 1e6  # H → μH
 
     def _required_ae_n(self, spec: DesignSpec, op: OperatingPoint) -> float:
         """Compute required Ae*N product (cm²) to keep B_avg below target.
@@ -175,51 +207,76 @@ class InductorLoss:
         self.db = db or CoreDatabase()
 
     def compute(self, design: InductorDesign, spec: DesignSpec,
-                op: OperatingPoint) -> LossResult:
+                op: OperatingPoint, trace=None) -> LossResult:
         core = design.core
         n_cores = design.n_cores
         ae_total = core.ae_cm2 * n_cores
         ve_total = core.ve_cm3 * n_cores
 
-        p_fe = self._core_loss(design, spec, op)
-        p_cu = self._copper_loss(design, spec, op)
+        if trace is not None:
+            p_fe = self._core_loss_line_cycle(design, spec, trace)
+            p_cu_lf, p_cu_hf = self._copper_loss_split(design, spec, trace)
+            p_cu = p_cu_lf + p_cu_hf
+            b_max = self._bmax_line_cycle(design, trace)
+            loss_model = "line_cycle"
+            model_confidence = "medium"
+            sub_losses = {"core": p_fe, "copper_lf": p_cu_lf, "copper_hf": p_cu_hf}
+            extra_meta = {
+                "B_max_line_cycle_T": b_max,
+                "copper_LF_W": p_cu_lf,
+                "copper_HF_W": p_cu_hf,
+                "winding_ac_model": "simplified_skin_proximity",
+                "winding_confidence": "medium",
+                "saturation_model": "simplified",
+            }
+        else:
+            p_fe = self._core_loss_legacy(design, spec, op)
+            p_cu = self._copper_loss_legacy(design, spec, op)
+            loss_model = "legacy_single_point"
+            model_confidence = "low"
+            b_max = calculate_b_max(design.L_eff_at_ipeak_uh, op.iin_peak,
+                                    design.n_turns, ae_total)
+            sub_losses = {"core": p_fe, "copper": p_cu}
+            extra_meta = {}
 
-        b_max = calculate_b_max(design.L_eff_at_ipeak_uh, op.iin_peak,
-                                design.n_turns, ae_total)
+        metadata = {
+            "core_part": core.part_number,
+            "core_material": core.material,
+            "n_cores": n_cores,
+            "turns": design.n_turns,
+            "L_target_uH": design.L_target_uh,
+            "L_noload_uH": design.L_noload_uh,
+            "L_eff_uH": design.L_eff_at_ipeak_uh,
+            "B_max_T": b_max,
+            "saturation_pct": (design.L_eff_at_ipeak_uh / design.L_noload_uh * 100
+                               if design.L_noload_uh > 0 else 0),
+            "window_fill": design.kw,
+            "loss_model": loss_model,
+            "model_confidence": model_confidence,
+            **extra_meta,
+        }
 
         return LossResult(
             component="Inductor (per phase)",
             power_loss_W=p_fe + p_cu,
-            sub_losses={"core": p_fe, "copper": p_cu},
-            metadata={
-                "core_part": core.part_number,
-                "core_material": core.material,
-                "n_cores": n_cores,
-                "turns": design.n_turns,
-                "L_target_uH": design.L_target_uh,
-                "L_noload_uH": design.L_noload_uh,
-                "L_eff_uH": design.L_eff_at_ipeak_uh,
-                "B_max_T": b_max,
-                "saturation_pct": (design.L_eff_at_ipeak_uh / design.L_noload_uh * 100
-                                   if design.L_noload_uh > 0 else 0),
-                "window_fill": design.kw,
-            }
+            sub_losses=sub_losses,
+            metadata=metadata,
         )
 
-    def _core_loss(self, design: InductorDesign, spec: DesignSpec,
-                   op: OperatingPoint) -> float:
+    # ── Legacy methods (kept for comparison) ────────────────────────
+
+    def _core_loss_legacy(self, design: InductorDesign, spec: DesignSpec,
+                          op: OperatingPoint) -> float:
         core = design.core
         ae_total = core.ae_cm2 * design.n_cores
         ve_total = core.ve_cm3 * design.n_cores
 
-        # AC flux swing at line peak
         vac_peak = op.vm
         d_peak = 1.0 - vac_peak / spec.vout
         delta_i = vac_peak * d_peak / (design.L_eff_at_ipeak_uh * UH_TO_H * spec.fsw)
         b_ac = calculate_b_ac(design.L_eff_at_ipeak_uh, delta_i,
                               design.n_turns, ae_total)
 
-        # Try Steinmetz (iGSE)
         st = self.db.get_steinmetz(core.material)
         if st is None:
             st = self.db.get_steinmetz(core.material_class)
@@ -228,44 +285,105 @@ class InductorLoss:
             ve_m3 = ve_total * 1e-6
             return st.core_loss(spec.fsw, b_ac, ve_m3, method='ose')
 
-        # Fallback: Mathcad empirical formula
         b_avg_gauss = calculate_b_max(design.L_eff_at_ipeak_uh,
                                       op.iin_peak * 2 / np.pi,
                                       design.n_turns, ae_total) * 1e4
         pv_W_cm3 = 3.89e-3 * (b_avg_gauss / 1000) ** 2.57 * (spec.fsw / 1000) ** 1.11
         return float(pv_W_cm3 * ve_total)
 
-    def _copper_loss(self, design: InductorDesign, spec: DesignSpec,
-                     op: OperatingPoint) -> float:
+    def _copper_loss_legacy(self, design: InductorDesign, spec: DesignSpec,
+                            op: OperatingPoint) -> float:
         core = design.core
-
         a_wire_mm2 = np.pi * (design.wire_d_mm / 2) ** 2 * design.n_parallel
         a_wire_m2 = a_wire_mm2 * 1e-6
-
         mlt_m = core.mlt_cm / 100
         total_length_m = design.n_turns * mlt_m
-
-        # DC resistance at estimated winding temperature
-        t_winding = spec.t_ambient + 40  # ~85°C for ambient 45°C
+        t_winding = spec.t_ambient + 40
         rho = rho_cu(t_winding)
         rdc = dc_resistance(rho, total_length_m, a_wire_m2)
-
-        # AC loss factors
         d_wire_m = design.wire_d_mm / 1000
         delta = skin_depth(spec.fsw, t_winding)
         f_skin = skin_effect_factor(d_wire_m, delta)
-
-        # Dowell proximity effect — toroidal distributed winding: ~1 layer
-        # Turns are spread around the core circumference, not stacked
         n_layers_est = 1
         f_prox = proximity_factor(n_layers_est, d_wire_m, delta)
-
-        # Total AC resistance factor
         f_ac = f_skin * f_prox
-
-        # RMS current includes both line-frequency and switching ripple
-        # For PFC boost inductor, RMS ≈ Irms * sqrt(1 + (r/3)^2) for triangular ripple
         r_eff = spec.ripple_ratio
         i_rms_total = op.iin_rms * np.sqrt(1 + (r_eff / 3) ** 2)
-
         return float(i_rms_total ** 2 * rdc * f_ac)
+
+    # ── Line-cycle core loss (OSE per angle, half-cycle averaged) ──
+
+    def _core_loss_line_cycle(self, design: InductorDesign, spec: DesignSpec,
+                              trace) -> float:
+        """Line-cycle-integrated OSE core loss.
+
+        For each theta:  delta_B_pp = L_eff * delta_i_pp / (N * Ae)
+                         B_ac_peak = delta_B_pp / 2   ← documented definition
+                         pv(theta) = k * fsw^alpha * B_ac_peak^beta
+        Then: Pcore = Ve * average_over_half_cycle(pv, theta)
+        """
+        from ..core.line_cycle import average_over_half_cycle
+
+        st = self.db.get_steinmetz(design.core.material)
+        if st is None:
+            st = self.db.get_steinmetz(design.core.material_class)
+        if st is None:
+            return self._core_loss_legacy(design, spec, trace.op)
+
+        ae_m2 = design.ae_total_cm2 * 1e-4
+        ve_m3 = design.ve_total_cm3 * 1e-6
+        L_eff_H = design.L_eff_at_ipeak_uh * 1e-6
+
+        delta_B_pp = L_eff_H * trace.delta_i_pp / (design.n_turns * ae_m2)
+        B_ac_peak = delta_B_pp / 2.0  # B_ac_peak = DeltaB_pp / 2
+
+        pv_density = st.k * spec.fsw ** st.alpha * B_ac_peak ** st.beta
+        pcore_mean = average_over_half_cycle(pv_density, trace.theta)
+        return float(pcore_mean * ve_m3)
+
+    # ── Line-cycle Bmax (max of instantaneous B over half cycle) ──
+
+    def _bmax_line_cycle(self, design: InductorDesign, trace) -> float:
+        """Bmax = max( L_eff * I_peak(theta) / (N * Ae) ) over half cycle."""
+        L_eff_H = design.L_eff_at_ipeak_uh * 1e-6
+        ae_m2 = design.ae_total_cm2 * 1e-4
+        B_inst = L_eff_H * trace.i_peak / (design.n_turns * ae_m2)
+        return float(np.max(B_inst))
+
+    # ── Split copper loss: LF (Rdc) + HF (Rac) ─────────────────────
+
+    def _copper_loss_split(self, design: InductorDesign, spec: DesignSpec,
+                           trace) -> tuple[float, float]:
+        """Return (Pcu_lf, Pcu_hf).
+
+        Pcu_lf = I_line_rms_phase^2 * Rdc(T)
+        Pcu_hf = mean(delta_i_pp^2/12) * Rac(fsw, geometry, T)
+        """
+        from ..core.line_cycle import average_over_half_cycle
+
+        core = design.core
+        a_wire_mm2 = np.pi * (design.wire_d_mm / 2) ** 2 * design.n_parallel
+        a_wire_m2 = a_wire_mm2 * 1e-6
+        mlt_m = core.mlt_cm / 100
+        total_length_m = design.n_turns * mlt_m
+
+        t_winding = spec.t_ambient + 40
+        rho = rho_cu(t_winding)
+        rdc = dc_resistance(rho, total_length_m, a_wire_m2)
+
+        d_wire_m = design.wire_d_mm / 1000
+        delta = skin_depth(spec.fsw, t_winding)
+        f_skin = skin_effect_factor(d_wire_m, delta)
+        n_layers_est = 1
+        f_prox = proximity_factor(n_layers_est, d_wire_m, delta)
+        rac = rdc * f_skin * f_prox
+
+        # LF: line-frequency RMS^2 * Rdc
+        i_lf_rms_sq = average_over_half_cycle(trace.i_avg_phase ** 2, trace.theta)
+        pcu_lf = float(i_lf_rms_sq * rdc)
+
+        # HF: mean(delta_i_pp^2 / 12) * Rac
+        i_hf_rms_sq = average_over_half_cycle(trace.delta_i_pp ** 2 / 12.0, trace.theta)
+        pcu_hf = float(i_hf_rms_sq * rac)
+
+        return pcu_lf, pcu_hf

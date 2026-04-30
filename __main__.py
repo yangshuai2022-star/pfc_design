@@ -26,13 +26,14 @@ def cli():
 @click.option("--vout", default=410.0, help="Output voltage (Vdc)")
 @click.option("--pout", default=7100.0, help="Total output power (W)")
 @click.option("--fsw", default=65000.0, help="Switching frequency (Hz)")
-@click.option("--ripple", default=1.0, help="Current ripple ratio")
+@click.option("--ripple", default=0.3, help="Current ripple ratio")
 @click.option("--core", default=None, help="Preferred core part number")
 @click.option("--mosfet", default=None, help="Preferred MOSFET part number")
 @click.option("--n-cores", default=2, help="Number of stacked cores")
 @click.option("--plot/--no-plot", default=True, help="Generate plots")
 @click.option("--save-plot", default=None, help="Save plots to directory")
-def run(vin, vout, pout, fsw, ripple, core, mosfet, n_cores, plot, save_plot):
+@click.option("--trace/--no-trace", default=False, help="Export line-cycle loss trace CSV")
+def run(vin, vout, pout, fsw, ripple, core, mosfet, n_cores, plot, save_plot, trace):
     """Single-point PFC design analysis with plots."""
     spec = DesignSpec(vin_min=vin, vout=vout, pout_total=pout, fsw=fsw, ripple_ratio=ripple)
     db = CoreDatabase()
@@ -51,6 +52,11 @@ def run(vin, vout, pout, fsw, ripple, core, mosfet, n_cores, plot, save_plot):
 
     _print_summary(result)
     _print_loss_table(result)
+
+    if trace:
+        out_dir = save_plot or os.path.join(os.path.expanduser("~"), "pfc_design", "output")
+        os.makedirs(out_dir, exist_ok=True)
+        _export_loss_trace_csv(result, os.path.join(out_dir, "loss_trace.csv"))
 
     if plot:
         if save_plot is None:
@@ -214,26 +220,39 @@ def _print_summary(result):
     spec = result["spec"]
     design = result["inductor_design"]
     mos = result["mosfet"]
+    dm = design.design_metadata
     click.echo(f"\n=== PFC Design Summary ===")
     click.echo(f"{spec.vin_min}-{spec.vin_max}V → {spec.vout}V | "
                f"{spec.pout_total/1000:.1f}kW | fsw={spec.fsw/1000:.0f}kHz | ripple r={spec.ripple_ratio:.2f}")
     click.echo(f"Core: {design.core.part_number} x{design.n_cores} | "
                f"N={design.n_turns} | L_eff={design.L_eff_at_ipeak_uh:.0f}uH")
+    im = result.get("inductor_metrics", {})
+    if im:
+        click.echo(f"L design: L_target={im.get('L_target_uH', 0):.0f}uH  "
+                   f"L_eff={im.get('L_eff_at_ipeak_uH', 0):.0f}uH "
+                   f"(trace用L_eff)")
+        click.echo(f"Ripple:   target r={im.get('target_ripple_ratio_peak_basis', 0):.3f}  "
+                   f"actual r={im.get('actual_ripple_ratio_peak_basis', 0):.3f}  "
+                   f"(ΔIpp_ref={im.get('delta_i_pp_ref_A', 0):.2f}A  "
+                   f"ΔIpp_actual={im.get('delta_i_pp_actual_A', 0):.2f}A)")
     click.echo(f"MOSFET: {mos.part_number} ({mos.technology}) | "
                f"Rds25={mos.rds_on_25c*1000:.0f}mΩ | Vds={mos.vds_max:.0f}V")
     click.echo(f"Wire: {design.wire_d_mm}mm x{design.n_parallel} | Window fill: {design.kw*100:.1f}%")
 
 
 def _print_loss_table(result):
-    click.echo(f"\n{'Component':<25} {'Loss (W)':>8}  {'%':>6}")
-    click.echo("-" * 42)
+    click.echo(f"\n{'Component':<35} {'Loss (W)':>8}  {'%':>6}")
+    click.echo("-" * 52)
     total = result["total_loss"]
     for name, val in result["breakdown"].items():
         if val > 0.3:
-            click.echo(f"{name:<25} {val:>7.1f}W {val/total*100:>5.1f}%")
-    click.echo("-" * 42)
-    click.echo(f"{'TOTAL':<25} {total:>7.1f}W {'100.0%':>6}")
-    click.echo(f"{'Efficiency':<25} {result['efficiency']*100:>7.2f}%")
+            # Clean up the key for display
+            label = (name.replace("_per_phase", " (per ph)")
+                     .replace("_total", " (total)").replace("_", " "))
+            click.echo(f"{label:<35} {val:>7.1f}W {val/total*100:>5.1f}%")
+    click.echo("-" * 52)
+    click.echo(f"{'TOTAL':<35} {total:>7.1f}W {'100.0%':>6}")
+    click.echo(f"{'Efficiency':<35} {result['efficiency']*100:>7.2f}%")
 
 
 def _generate_plots(result, save_dir):
@@ -295,6 +314,129 @@ def _generate_plots(result, save_dir):
         subprocess.run(["explorer.exe", win_path], capture_output=True)
     else:
         subprocess.run(["explorer.exe", save_dir], capture_output=True)
+
+
+def _export_loss_trace_csv(result, path):
+    """Write loss_trace.csv with per-angle loss densities.
+
+    All field names use _phase suffix for per-phase current/voltage,
+    and density fields are per-radian at that theta point.
+    """
+    trace = result.get("trace")
+    if trace is None:
+        click.echo("No line-cycle trace available.")
+        return
+
+    spec = result["spec"]
+    mosfet = result["mosfet"]
+    design = result["inductor_design"]
+
+    # Per-angle constants
+    rds_tj = mosfet.rds_on_25c * (1 + mosfet.rds_alpha * (80 - 25))
+    coss_er = mosfet.coss_er
+    tr = mosfet.tr
+    tf = mosfet.tf
+    vout = spec.vout
+    fsw = spec.fsw
+    vf = spec.diode_vf
+    rd = spec.diode_rd
+    qrr = 2e-6 if spec.diode_type.upper() != "SIC" else 0.0
+
+    # Winding Rdc / Rac (simplified — approximate, same as loss model)
+    from .magnetics.winding import skin_effect_factor, proximity_factor, dc_resistance
+    from .core.constants import rho_cu, skin_depth
+    core_obj = design.core
+    a_wire_mm2 = np.pi * (design.wire_d_mm / 2) ** 2 * design.n_parallel
+    a_wire_m2 = a_wire_mm2 * 1e-6
+    mlt_m = core_obj.mlt_cm / 100
+    total_length_m = design.n_turns * mlt_m
+    t_winding = spec.t_ambient + 40
+    rho = rho_cu(t_winding)
+    rdc_wire = dc_resistance(rho, total_length_m, a_wire_m2)
+    d_wire_m = design.wire_d_mm / 1000
+    delta_skin = skin_depth(fsw, t_winding)
+    f_skin = skin_effect_factor(d_wire_m, delta_skin)
+    f_prox = proximity_factor(1, d_wire_m, delta_skin)
+    rac_wire = rdc_wire * f_skin * f_prox
+
+    # Core loss Steinmetz coefficients
+    from .magnetics.core_database import CoreDatabase
+    db = CoreDatabase()
+    st = db.get_steinmetz(core_obj.material)
+    if st is None:
+        st = db.get_steinmetz(core_obj.material_class)
+    k, alpha, beta = (st.k, st.alpha, st.beta) if st else (0, 0, 0)
+    L_eff_H = design.L_eff_at_ipeak_uh * 1e-6
+    N_turns = design.n_turns
+    Ae_m2 = design.ae_total_cm2 * 1e-4
+
+    rows = []
+    for i in range(len(trace.theta)):
+        duty_i = trace.duty[i]
+        off_duty = 1.0 - duty_i
+        delta_i_i = trace.delta_i_pp[i]
+        i_rms_sq_i = trace.i_rms_local_sq[i]
+
+        # MOSFET conduction density
+        mosfet_cond = rds_tj * duty_i * i_rms_sq_i
+
+        # MOSFET switching energy density
+        mosfet_eon = 0.5 * vout * trace.i_valley[i] * tr
+        mosfet_eoff = 0.5 * vout * trace.i_peak[i] * tf
+        # Per-switching-cycle energy → per-radian average over half cycle
+        # E per radian = fsw * E_per_switching * (T_half / pi) ≈ E_per_sw / dtheta
+        # Actually simpler: the density for this theta bin is fsw * E(θ) / pi
+        mosfet_sw_eon_density = fsw * mosfet_eon
+        mosfet_sw_eoff_density = fsw * mosfet_eoff
+
+        # Coss density (constant per switching cycle)
+        mosfet_coss_density = 0.5 * coss_er * vout ** 2 * fsw
+
+        # Diode forward
+        diode_fwd = vf * off_duty * trace.i_avg_phase[i] + rd * off_duty * i_rms_sq_i
+        # Diode RR (constant per switching cycle)
+        diode_rr = fsw * qrr * vout
+
+        # Core loss density
+        if st and N_turns > 0:
+            delta_B_pp = L_eff_H * delta_i_i / (N_turns * Ae_m2)
+            B_ac_peak = delta_B_pp / 2.0
+            core_loss = k * fsw ** alpha * B_ac_peak ** beta if B_ac_peak > 0 else 0.0
+        else:
+            core_loss = 0.0
+
+        # Winding densities
+        winding_lf = trace.i_avg_phase[i] ** 2 * rdc_wire
+        winding_hf = (delta_i_i ** 2 / 12.0) * rac_wire
+
+        rows.append({
+            "theta_deg": round(trace.theta_deg[i], 4),
+            "sin_theta": round(trace.sin_theta[i], 6),
+            "vin_abs": round(trace.vin_abs[i], 4),
+            "i_avg_phase": round(trace.i_avg_phase[i], 4),
+            "duty": round(duty_i, 6),
+            "delta_i_pp": round(delta_i_i, 4),
+            "i_peak": round(trace.i_peak[i], 4),
+            "i_valley": round(trace.i_valley[i], 4),
+            "i_rms_local_sq": round(i_rms_sq_i, 4),
+            "mosfet_cond_density": round(mosfet_cond, 6),
+            "mosfet_eon_density": round(mosfet_sw_eon_density, 6),
+            "mosfet_eoff_density": round(mosfet_sw_eoff_density, 6),
+            "mosfet_coss_density": round(mosfet_coss_density, 6),
+            "diode_forward_density": round(diode_fwd, 6),
+            "diode_rr_density": round(diode_rr, 6),
+            "core_loss_density": round(core_loss, 6),
+            "winding_lf_density": round(winding_lf, 6),
+            "winding_hf_density": round(winding_hf, 6),
+        })
+
+    import csv
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+    click.echo(f"Loss trace CSV saved: {path}  ({len(rows)} rows)")
 
 
 def _plot_efficiency_plateau(df_feasible):
