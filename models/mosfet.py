@@ -54,11 +54,23 @@ class MosfetLoss:
         # Temperature-adjusted Rds_on
         rds_tj = rds_25 * (1 + rds_alpha * (t_j - 25))
 
+        # Datasheet Eon/Eoff model (linear V/I scaling) if reference data
+        # exists; otherwise fall back to the tr/tf linear-ramp estimate.
+        has_e_curves = (mosfet is not None and mosfet.eon_ref_uj > 0
+                        and mosfet.eoff_ref_uj > 0)
+
         if trace is not None:
             p_cond = self._conduction_loss_line_cycle(trace, rds_tj)
-            p_sw = self._switching_loss_line_cycle(spec, trace, tr, tf)
+            e_curves = None
+            if has_e_curves:
+                e_curves = (mosfet.eon_ref_uj, mosfet.eoff_ref_uj,
+                            mosfet.e_ref_v, mosfet.e_ref_i)
+            p_sw = self._switching_loss_line_cycle(spec, trace, tr, tf,
+                                                   e_curves=e_curves)
             loss_model = "line_cycle"
+            sw_model = ("datasheet_Eon_Eoff" if e_curves else "linear_tr_tf")
             extra_meta = {
+                "switching_model": sw_model,
                 "coss_accounting_note": (
                     "Simplified — if datasheet Eoff includes Coss energy, "
                     "future versions must avoid double-counting"
@@ -123,18 +135,35 @@ class MosfetLoss:
     # ── Line-cycle switching loss (valley/peak currents) ──────────
 
     def _switching_loss_line_cycle(self, spec: DesignSpec, trace,
-                                   tr: float, tf: float) -> float:
+                                   tr: float, tf: float,
+                                   e_curves: tuple | None = None) -> float:
         """Psw = fsw * mean( Eon(theta) + Eoff(theta) ).
 
         Boost CCM:  turn-on  current ≈ I_valley (valley of ripple)
                     turn-off current ≈ I_peak   (peak of ripple)
 
-        Eon  = 0.5 * Vout * I_valley * tr
-        Eoff = 0.5 * Vout * I_peak   * tf
+        With datasheet reference energies (e_curves =
+        (Eon_ref_uJ, Eoff_ref_uJ, V_ref, I_ref)):
+            Eon(V,I)  = Eon_ref  * (V/V_ref) * (I/I_ref)
+            Eoff(V,I) = Eoff_ref * (V/V_ref) * (I/I_ref)
+        linear scaling in both voltage and current — the common
+        engineering approximation of the datasheet curves.
+
+        Without reference data (fallback, legacy):
+            Eon  = 0.5 * Vout * I_valley * tr
+            Eoff = 0.5 * Vout * I_peak   * tf
         """
         from ..core.line_cycle import average_over_half_cycle
-        e_on = 0.5 * spec.vout * trace.i_valley * tr
-        e_off = 0.5 * spec.vout * trace.i_peak * tf
+        vout = spec.vout
+        if e_curves is not None:
+            eon_ref_uj, eoff_ref_uj, v_ref, i_ref = e_curves
+            k_on = eon_ref_uj * 1e-6 / (v_ref * i_ref)
+            k_off = eoff_ref_uj * 1e-6 / (v_ref * i_ref)
+            e_on = k_on * vout * trace.i_valley
+            e_off = k_off * vout * trace.i_peak
+        else:
+            e_on = 0.5 * vout * trace.i_valley * tr
+            e_off = 0.5 * vout * trace.i_peak * tf
         e_mean = average_over_half_cycle(e_on + e_off, trace.theta)
         return float(spec.fsw * e_mean)
 

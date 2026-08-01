@@ -16,6 +16,10 @@ from ..magnetics.saturation import (
 )
 from .base import LossResult
 
+# Ripple-spec match: the design counts as meeting the target when
+# L_eff(I_peak) reaches 98% of the inductance implied by the spec.
+L_TARGET_MATCH_TOL = 0.02
+
 
 class InductorDesign:
     """Result of inductor design calculations."""
@@ -88,36 +92,67 @@ class InductorDesigner:
         n_al = np.sqrt(L_target_uh * 1000 / al_total) if al_total > 0 else 50
         n_turns = round(n_al)
 
-        # Step 4: Calculate actual no-load inductance using AL (datasheet value)
+        # Step 4: Select wire (independent of turns)
+        wire_d_mm, n_parallel = self._select_wire(spec, op, n_turns)
+
+        # Step 5-6: Iterate turns so the *effective* inductance at the
+        # peak current honors the ripple spec, subject to B_max < 0.7*Bsat
+        # and window fill < 60%. L_eff(I_peak) is unimodal in the droop
+        # region (rises then falls as turns push deeper into saturation),
+        # so we scan upward and keep the best feasible candidate.
+        # The DC-bias droop (L_eff < L_noload) is exactly what the old
+        # loop ignored — it designed to the no-load inductance and the
+        # actual ripple came out above spec (the high_risk finding).
+        safe_b = core.bs_T * 0.7
+        a_wire_mm2 = np.pi * (wire_d_mm / 2) ** 2 * n_parallel
+        aw_mm2 = core.aw_cm2 * 100
+        l_eff_target = L_target_uh * (1.0 - L_TARGET_MATCH_TOL)
+        best_n, best_leff = n_turns, -1.0
+        fallback_n, fallback_b = n_turns, float('inf')
+        prev_leff = -1.0
+        limited_by = "iteration_cap"
+        for _ in range(200):
+            l0_uh = core.al_nH_per_t2 * n_cores * n_turns ** 2 / 1000
+            leff = effective_inductance(l0_uh, n_turns, il_peak,
+                                        core.le_cm, core.dc_bias_coeffs)
+            b_peak = calculate_b_max(leff, il_peak, n_turns,
+                                     core.ae_cm2 * n_cores)
+            kw = a_wire_mm2 * n_turns / aw_mm2 if aw_mm2 > 0 else 1.0
+
+            if b_peak < fallback_b:
+                fallback_n, fallback_b = n_turns, b_peak
+            feasible_turns = b_peak <= safe_b and kw <= 0.60
+            if feasible_turns and leff > best_leff:
+                best_n, best_leff = n_turns, leff
+            if feasible_turns and leff >= l_eff_target:
+                limited_by = "none"
+                break
+            if b_peak <= safe_b and leff < prev_leff * 1.002:
+                # B-safe region, L_eff past its droop peak: no better N exists
+                limited_by = "droop_peak"
+                break
+            prev_leff = leff
+            n_turns += 1
+
+        if best_leff < 0:
+            # No B-safe N exists in the scan: return the B-max-minimizing N
+            # (deepest droop), which the sweep will flag as infeasible.
+            n_turns = int(fallback_n)
+        else:
+            n_turns = int(best_n)
         al_total = core.al_nH_per_t2 * n_cores
-        L_noload_uh = al_total * n_turns**2 / 1000  # nH/t² → μH
+        L_noload_uh = al_total * n_turns ** 2 / 1000
 
-        # Step 5: Check saturation using RMS current (Mathcad convention)
-        L_eff = effective_inductance(L_noload_uh, n_turns, op.iin_rms,
-                                     core.le_cm, core.dc_bias_coeffs)
-
-        # Step 6: Iterate to find stable design
-        # Check B_max with effective L at IL_peak (includes ripple)
+        # Effective inductance at peak current (ripple-defining condition)
         L_eff_peak = effective_inductance(L_noload_uh, n_turns, il_peak,
                                           core.le_cm, core.dc_bias_coeffs)
+        L_eff = effective_inductance(L_noload_uh, n_turns, op.iin_rms,
+                                     core.le_cm, core.dc_bias_coeffs)
         b_peak = calculate_b_max(L_eff_peak, il_peak, n_turns,
                                  core.ae_cm2 * n_cores)
-        safe_b = core.bs_T * 0.7
-        iterations = 0
-        while b_peak > safe_b and iterations < 20:
-            n_turns += 1
-            al_total = core.al_nH_per_t2 * n_cores
-            L_noload_uh = al_total * n_turns**2 / 1000
-            L_eff_peak = effective_inductance(L_noload_uh, n_turns, il_peak,
-                                              core.le_cm, core.dc_bias_coeffs)
-            L_eff = effective_inductance(L_noload_uh, n_turns, op.iin_rms,
-                                         core.le_cm, core.dc_bias_coeffs)
-            b_peak = calculate_b_max(L_eff_peak, il_peak, n_turns,
-                                     core.ae_cm2 * n_cores)
-            iterations += 1
+        l_eff_target_met = L_eff_peak >= l_eff_target
 
-        # Step 7: Select wire
-        wire_d_mm, n_parallel = self._select_wire(spec, op, n_turns)
+        # Step 7: (wire already selected)
 
         return InductorDesign(
             core=core, n_turns=n_turns,
@@ -135,6 +170,12 @@ class InductorDesigner:
                 "IL_peak_with_ripple": il_peak,
                 "DeltaI_pp_ref": delta_i_ref,
                 "ripple_definition": "ripple_ratio = DeltaI_pp_at_line_peak / Iin_pk_phase",
+                "L_eff_target_uh": l_eff_target,
+                "L_eff_ratio_to_target": (L_eff_peak / L_target_uh
+                                          if L_target_uh > 0 else 0.0),
+                "L_eff_target_met": l_eff_target_met,
+                "l_eff_limited_by": limited_by,
+                "design_loop": "L_eff(I_peak) targeted, Bmax/window guarded",
             },
         )
 
@@ -207,7 +248,18 @@ class InductorLoss:
         self.db = db or CoreDatabase()
 
     def compute(self, design: InductorDesign, spec: DesignSpec,
-                op: OperatingPoint, trace=None) -> LossResult:
+                op: OperatingPoint, trace=None,
+                t_winding: float | None = None) -> LossResult:
+        """Compute inductor losses: core + copper.
+
+        Args:
+            design: inductor design result
+            spec: design specification
+            op: operating point
+            trace: optional LineCycleTrace for line-cycle integration
+            t_winding: winding temperature in °C (defaults to
+                       spec.t_ambient + 40, the legacy assumption)
+        """
         core = design.core
         n_cores = design.n_cores
         ae_total = core.ae_cm2 * n_cores
@@ -215,7 +267,8 @@ class InductorLoss:
 
         if trace is not None:
             p_fe = self._core_loss_line_cycle(design, spec, trace)
-            p_cu_lf, p_cu_hf = self._copper_loss_split(design, spec, trace)
+            p_cu_lf, p_cu_hf = self._copper_loss_split(design, spec, trace,
+                                                       t_winding=t_winding)
             p_cu = p_cu_lf + p_cu_hf
             b_max = self._bmax_line_cycle(design, trace)
             loss_model = "line_cycle"
@@ -231,7 +284,8 @@ class InductorLoss:
             }
         else:
             p_fe = self._core_loss_legacy(design, spec, op)
-            p_cu = self._copper_loss_legacy(design, spec, op)
+            p_cu = self._copper_loss_legacy(design, spec, op,
+                                            t_winding=t_winding)
             loss_model = "legacy_single_point"
             model_confidence = "low"
             b_max = calculate_b_max(design.L_eff_at_ipeak_uh, op.iin_peak,
@@ -292,13 +346,15 @@ class InductorLoss:
         return float(pv_W_cm3 * ve_total)
 
     def _copper_loss_legacy(self, design: InductorDesign, spec: DesignSpec,
-                            op: OperatingPoint) -> float:
+                            op: OperatingPoint,
+                            t_winding: float | None = None) -> float:
         core = design.core
         a_wire_mm2 = np.pi * (design.wire_d_mm / 2) ** 2 * design.n_parallel
         a_wire_m2 = a_wire_mm2 * 1e-6
         mlt_m = core.mlt_cm / 100
         total_length_m = design.n_turns * mlt_m
-        t_winding = spec.t_ambient + 40
+        if t_winding is None:
+            t_winding = spec.t_ambient + 40
         rho = rho_cu(t_winding)
         rdc = dc_resistance(rho, total_length_m, a_wire_m2)
         d_wire_m = design.wire_d_mm / 1000
@@ -353,7 +409,8 @@ class InductorLoss:
     # ── Split copper loss: LF (Rdc) + HF (Rac) ─────────────────────
 
     def _copper_loss_split(self, design: InductorDesign, spec: DesignSpec,
-                           trace) -> tuple[float, float]:
+                           trace, t_winding: float | None = None
+                           ) -> tuple[float, float]:
         """Return (Pcu_lf, Pcu_hf).
 
         Pcu_lf = I_line_rms_phase^2 * Rdc(T)
@@ -367,7 +424,8 @@ class InductorLoss:
         mlt_m = core.mlt_cm / 100
         total_length_m = design.n_turns * mlt_m
 
-        t_winding = spec.t_ambient + 40
+        if t_winding is None:
+            t_winding = spec.t_ambient + 40
         rho = rho_cu(t_winding)
         rdc = dc_resistance(rho, total_length_m, a_wire_m2)
 

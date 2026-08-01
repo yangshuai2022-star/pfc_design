@@ -20,6 +20,7 @@ def shared_spec():
         f_line=50.0, fsw=65_000.0, ripple_ratio=1.0,
         eta_target=0.96, core_material_pref="Sendust",
         diode_vf=1.5, diode_rd=0.1, diode_type="SiC",
+        diode_part=None,           # shared fixtures predate the diode database
         bridge_vf=1.0, bridge_rd=0.0,
         c_out_total=1320e-6, cap_esr=0.15, cap_n_parallel=4,
     )

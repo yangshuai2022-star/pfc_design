@@ -8,8 +8,8 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-from .core.spec import DesignSpec, MosfetDatabase
-from .core.operating_point import compute_mathcad_operating_point
+from .core.spec import DesignSpec, MosfetDatabase, DiodeDatabase
+from .core.operating_point import compute_mathcad_operating_point, OperatingPoint
 from .magnetics.core_database import CoreDatabase
 from .models.system import SystemAnalyzer
 from .optimization.sweep import ParamSweep
@@ -37,9 +37,16 @@ def cli():
 @click.option("--plot/--no-plot", default=True, help="Generate plots")
 @click.option("--save-plot", default=None, help="Save plots to directory")
 @click.option("--trace/--no-trace", default=False, help="Export line-cycle loss trace CSV")
-def run(vin, vout, pout, fsw, ripple, core, mosfet, n_cores, plot, save_plot, trace):
+@click.option("--diode", default=None, help="Boost diode part number (e.g. C4D10120H)")
+@click.option("--thermal", is_flag=True, default=False,
+              help="Self-consistent loss<->temperature loop (Tj/T_winding)")
+def run(vin, vout, pout, fsw, ripple, core, mosfet, n_cores, plot, save_plot,
+        trace, diode, thermal):
     """Single-point PFC design analysis with plots."""
-    spec = DesignSpec(vin_min=vin, vout=vout, pout_total=pout, fsw=fsw, ripple_ratio=ripple)
+    spec = DesignSpec(vin_min=vin, vout=vout, pout_total=pout, fsw=fsw,
+                      ripple_ratio=ripple, thermal_model=thermal)
+    if diode:
+        spec.diode_part = diode   # None -> keep the spec default (SiC part)
     db = CoreDatabase()
     mdb = MosfetDatabase()
 
@@ -50,6 +57,9 @@ def run(vin, vout, pout, fsw, ripple, core, mosfet, n_cores, plot, save_plot, tr
         click.echo(f"Core '{core}' not found, auto-selecting.")
     if mosfet and not preferred_mosfet:
         click.echo(f"MOSFET '{mosfet}' not found, auto-selecting.")
+
+    if diode and not DiodeDatabase().get(diode):
+        click.echo(f"Diode '{diode}' not found, falling back to spec Vf/Rd.")
 
     analyzer = SystemAnalyzer(db)
     result = analyzer.analyze(spec, preferred_core=preferred_core, mosfet=preferred_mosfet, n_cores=n_cores)
@@ -87,13 +97,24 @@ def run(vin, vout, pout, fsw, ripple, core, mosfet, n_cores, plot, save_plot, tr
               help="Allow designs with actual ripple exceeding limits (warning only)")
 @click.option("--diverse", is_flag=True, default=False,
               help="Show per-core and per-MOSFET best candidates")
+@click.option("--refine", is_flag=True, default=False,
+              help="Local-refine top grid designs (scipy Nelder-Mead on fsw x ripple)")
+@click.option("--heuristic", is_flag=True, default=False,
+              help="Run differential-evolution global search after the grid sweep")
+@click.option("--diode", default=None, help="Boost diode part number (e.g. C4D10120H)")
+@click.option("--thermal", is_flag=True, default=False,
+              help="Self-consistent loss<->temperature loop in the sweep")
 @click.option("--top", default=10, help="Show top N results")
 @click.option("--csv", default=None, help="Save full sweep results to CSV")
 def optimize(vin, vout, pout, fsw, fsw_start, fsw_stop, fsw_step,
              ripple_start, ripple_stop, ripple_n, tech, core_material,
-             core_limit, n_cores, top, csv, allow_aggressive_ripple, diverse):
+             core_limit, n_cores, top, csv, allow_aggressive_ripple,
+             diverse, refine, heuristic, diode, thermal):
     """Sweep optimization: ripple x core x MOSFET (fsw optional sweep)."""
-    spec = DesignSpec(vin_min=vin, vout=vout, pout_total=pout)
+    spec = DesignSpec(vin_min=vin, vout=vout, pout_total=pout,
+                      thermal_model=thermal)
+    if diode:
+        spec.diode_part = diode   # None -> keep the spec default (SiC part)
 
     db = CoreDatabase()
     mdb = MosfetDatabase()
@@ -212,7 +233,293 @@ def optimize(vin, vout, pout, fsw, fsw_start, fsw_stop, fsw_step,
         # --- Efficiency Plateau Plot ---
         _plot_efficiency_plateau(feasible)
 
+    if refine or heuristic:
+        _run_heuristic_stage(df, spec, cores, mosfets, db, n_cores,
+                             refine, heuristic)
+
     _print_infeasible_summary(df)
+
+
+@cli.command()
+@click.option("--vin", default=176.0, help="Design-point line voltage (Vrms, worst case)")
+@click.option("--vin-list", default="176,220,264", help="Line voltages for the map (Vrms, comma-separated)")
+@click.option("--load-list", default="10,25,50,75,100", help="Load points, % of Pout (comma-separated)")
+@click.option("--vout", default=410.0, help="Output voltage (Vdc)")
+@click.option("--pout", default=7100.0, help="Rated output power (W)")
+@click.option("--fsw", default=65000.0, help="Switching frequency (Hz)")
+@click.option("--ripple", default=0.3, help="Current ripple ratio")
+@click.option("--core", default=None, help="Core part number")
+@click.option("--mosfet", default=None, help="MOSFET part number")
+@click.option("--diode", default=None, help="Boost diode part number")
+@click.option("--n-cores", default=2, help="Number of stacked cores")
+@click.option("--thermal", is_flag=True, default=False,
+              help="Self-consistent loss<->temperature loop")
+@click.option("--csv", default=None, help="Save map to CSV")
+@click.option("--plot/--no-plot", default=True, help="Save efficiency curves PNG")
+def map(vin, vin_list, load_list, vout, pout, fsw, ripple, core, mosfet,
+        diode, n_cores, thermal, csv, plot):
+    """Efficiency map: line voltage x load, fixed hardware (rated-point design)."""
+    from .models.system import SystemAnalyzer
+    from .core.operating_point import OperatingPoint
+
+    vins = [float(x) for x in vin_list.split(",")]
+    loads = [float(x) for x in load_list.split(",")]
+
+    spec = DesignSpec(vin_min=vin, vout=vout, pout_total=pout, fsw=fsw,
+                      ripple_ratio=ripple, thermal_model=thermal)
+    if diode:
+        spec.diode_part = diode   # None -> keep the spec default (SiC part)
+    db = CoreDatabase()
+    mdb = MosfetDatabase()
+    analyzer = SystemAnalyzer(db)
+    preferred_core = db.get_by_part_number(core) if core else None
+    preferred_mosfet = mdb.get(mosfet) if mosfet else None
+
+    # Fixed hardware: design once at the rated (worst-case) point
+    base_op = compute_mathcad_operating_point(spec)
+    base = analyzer.analyze(spec, base_op, preferred_core=preferred_core,
+                            mosfet=preferred_mosfet, n_cores=n_cores)
+    design = base["inductor_design"]
+    click.echo(f"\nHardware fixed at design point: {spec.vin_min:.0f}V / "
+               f"{spec.pout_total/1000:.1f}kW / fsw={spec.fsw/1000:.0f}kHz / "
+               f"ripple={spec.ripple_ratio:.2f}")
+    click.echo(f"  Core {design.core.part_number} x{design.n_cores}  N={design.n_turns}  "
+               f"L_eff={design.L_eff_at_ipeak_uh:.0f}uH  |  "
+               f"{base['mosfet'].part_number}  |  "
+               f"{base['diode'].part_number if base['diode'] else spec.diode_type}")
+    click.echo("  (CCM model — below ~20% load the real controller goes "
+               "burst/DCM, numbers optimistic)\n")
+
+    rows = []
+    for vin_map in vins:
+        for load_pct in loads:
+            s = spec.clone()
+            s.pout_total = pout * load_pct / 100.0
+            op = OperatingPoint(s, vin_rms=vin_map)
+            r = analyzer.analyze(s, op, preferred_core=preferred_core,
+                                 mosfet=preferred_mosfet, n_cores=n_cores,
+                                 design=design)
+            th = r["thermal"]
+            rows.append({
+                "vin_V": vin_map, "load_pct": load_pct,
+                "pout_W": s.pout_total,
+                "efficiency_pct": r["efficiency"] * 100,
+                "total_loss_W": r["total_loss"],
+                "P_inductor_W": r["breakdown"].get("Inductor_core_per_phase", 0)
+                                + r["breakdown"].get("Inductor_copper_lf_per_phase", 0)
+                                + r["breakdown"].get("Inductor_copper_hf_per_phase", 0)
+                                + r["breakdown"].get("Inductor_copper_per_phase", 0),
+                "P_mosfet_W": r["breakdown"].get("MOSFET_conduction_per_phase", 0)
+                              + r["breakdown"].get("MOSFET_switching_per_phase", 0)
+                              + r["breakdown"].get("MOSFET_Coss_per_phase", 0)
+                              + r["breakdown"].get("MOSFET_gate_drive_per_phase", 0),
+                "P_diode_W": r["breakdown"].get("Diode_forward_per_phase", 0)
+                             + r["breakdown"].get("Diode_reverse_recovery_per_phase", 0),
+                "P_bridge_W": r["breakdown"].get("Bridge_forward_Vf_total", 0),
+                "P_cap_W": r["breakdown"].get("Capacitor_ESR_total", 0),
+                "Tj_mosfet_C": th["t_j_mosfet"] if th["enabled"] else 80.0,
+            })
+
+    click.echo(f"{'Vin':>5} {'Load':>5} {'Pout':>6} {'eta':>6} "
+               f"{'Loss':>6} {'P_ind':>5} {'P_mos':>5} {'P_dio':>5} "
+               f"{'P_br':>5} {'P_cap':>5} {'Tj_mos':>6}")
+    click.echo("-" * 76)
+    for row in rows:
+        click.echo(f"{row['vin_V']:>4.0f}V {row['load_pct']:>4.0f}% "
+                   f"{row['pout_W']/1000:>5.1f}k {row['efficiency_pct']:>5.2f}% "
+                   f"{row['total_loss_W']:>5.1f}W {row['P_inductor_W']:>4.1f}W "
+                   f"{row['P_mosfet_W']:>4.1f}W {row['P_diode_W']:>4.1f}W "
+                   f"{row['P_bridge_W']:>4.1f}W {row['P_cap_W']:>4.1f}W "
+                   f"{row['Tj_mosfet_C']:>5.0f}C")
+
+    if csv:
+        import pandas as pd
+        csv_dir = os.path.dirname(os.path.abspath(csv))
+        if csv_dir:
+            os.makedirs(csv_dir, exist_ok=True)
+        pd.DataFrame(rows).to_csv(csv, index=False)
+        click.echo(f"\nMap CSV saved: {csv}")
+
+    if plot:
+        _plot_eff_map(rows, vins)
+
+
+def _plot_eff_map(rows, vins):
+    """Efficiency vs load curves, one line per input voltage."""
+    fig, ax = plt.subplots(figsize=(9, 6))
+    for vin in vins:
+        sub = [r for r in rows if r["vin_V"] == vin]
+        x = [r["load_pct"] for r in sub]
+        y = [r["efficiency_pct"] for r in sub]
+        ax.plot(x, y, "o-", label=f"{vin:.0f}V")
+    ax.set_xlabel("Load (% of rated)")
+    ax.set_ylabel("Efficiency (%)")
+    ax.set_title("PFC Efficiency Map (fixed hardware)")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    save_dir = os.path.join(os.path.expanduser("~"), "pfc_design", "output")
+    os.makedirs(save_dir, exist_ok=True)
+    f = os.path.join(save_dir, "efficiency_map.png")
+    plt.tight_layout()
+    plt.savefig(f, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    click.echo(f"Efficiency map plot saved: {f}")
+
+
+@cli.command()
+@click.option("--tech", default="", help="Technology filter (SiC Schottky/Si Fast Recovery)")
+def diodes(tech):
+    """List available boost diodes."""
+    from .core.spec import DiodeDatabase
+    results = DiodeDatabase().query(technology=tech)
+    click.echo(f"\n{'Part Number':<22} {'Tech':<16} {'Vrr':>5} {'If25':>5} "
+               f"{'Vf25':>5} {'Vf150':>5} {'Qrr':>6} {'Price':>6}")
+    click.echo("-" * 76)
+    for d in results:
+        click.echo(f"{d.part_number:<22} {d.technology:<16} {d.vrr_max:>4.0f}V "
+                   f"{d.if_25c:>4.0f}A {d.vf_25c:>5.2f}V {d.vf_150c:>5.2f}V "
+                   f"{d.qrr_nc:>5.0f}nC ${d.price_usd:>5.1f}")
+
+
+@cli.command()
+@click.option("--vin", default=176.0, help="Input voltage (Vrms)")
+@click.option("--vout", default=410.0, help="Output voltage (Vdc)")
+@click.option("--pout", default=7100.0, help="Total output power (W)")
+@click.option("--fsw", default=65000.0, help="Switching frequency (Hz)")
+@click.option("--ripple", default=0.3, help="Current ripple ratio")
+@click.option("--core", default=None, help="Preferred core part number")
+@click.option("--mosfet", default=None, help="Boost MOSFET (bridge PFC baseline)")
+@click.option("--diode", default="C4D10120H", help="Boost diode (bridge PFC baseline)")
+@click.option("--hf-mosfet", default=None, help="Totem HF leg device (default GS66516T GaN)")
+@click.option("--slow-mosfet", default="IPW65R032M8", help="Totem line-frequency leg device")
+@click.option("--deadtime", default=100.0, help="SR deadtime (ns)")
+@click.option("--vfb", default=2.0, help="Body/reverse conduction drop (V)")
+@click.option("--n-cores", default=2, help="Number of stacked cores")
+@click.option("--thermal", is_flag=True, default=False,
+              help="Self-consistent loss<->temperature loop")
+@click.option("--plot/--no-plot", default=False, help="Save loss comparison bar chart")
+def totem(vin, vout, pout, fsw, ripple, core, mosfet, diode, hf_mosfet,
+          slow_mosfet, deadtime, vfb, n_cores, thermal, plot):
+    """Compare bridge boost vs totem-pole bridgeless PFC (same magnetics)."""
+    from .models.system import SystemAnalyzer
+    from .models.totem_pole import TotemPoleAnalyzer
+
+    spec = DesignSpec(vin_min=vin, vout=vout, pout_total=pout, fsw=fsw,
+                      ripple_ratio=ripple, diode_part=diode,
+                      thermal_model=thermal)
+    db = CoreDatabase()
+    mdb = MosfetDatabase()
+    preferred_core = db.get_by_part_number(core) if core else None
+    preferred_mosfet = mdb.get(mosfet) if mosfet else None
+
+    click.echo(f"\n{'='*78}")
+    click.echo(f"  Topology comparison — bridge boost vs totem-pole bridgeless")
+    click.echo(f"  {vin:.0f}V -> {vout:.0f}V | {pout/1000:.1f}kW | fsw={fsw/1000:.0f}kHz "
+               f"| ripple={ripple:.2f} | n_phases={spec.n_phases}")
+    click.echo(f"{'='*78}")
+
+    boost = SystemAnalyzer(db).analyze(spec, preferred_core=preferred_core,
+                                       mosfet=preferred_mosfet, n_cores=n_cores)
+    totem_r = TotemPoleAnalyzer(db).analyze(
+        spec, preferred_core=preferred_core, mosfet=mdb.get(hf_mosfet)
+        if hf_mosfet else None, slow_mosfet=mdb.get(slow_mosfet),
+        n_cores=n_cores, deadtime_s=deadtime * 1e-9, vf_body=vfb)
+
+    design = boost["inductor_design"]
+    click.echo(f"  Inductor (identical in both): {design.core.part_number} "
+               f"x{design.n_cores}  N={design.n_turns}  "
+               f"L_eff={design.L_eff_at_ipeak_uh:.0f}uH")
+    click.echo(f"  Boost: {boost['mosfet'].part_number} + {boost['diode'].part_number if boost['diode'] else spec.diode_type}")
+    click.echo(f"  Totem: HF={totem_r['mosfet'].part_number} "
+               f"(GaN), slow={totem_r['slow_mosfet'].part_number} "
+               f"| deadtime={deadtime:.0f}ns, Vfb={vfb:.1f}V\n")
+
+    # Build per-component comparison (per-phase entries already scaled by n)
+    def _total(result, prefixes):
+        return sum(v for k, v in result["breakdown"].items()
+                   if any(k.startswith(p) for p in prefixes))
+
+    rows = [
+        ("Inductor core", "Inductor_core_",
+         _total(boost, ["Inductor_core_"]),
+         _total(totem_r, ["Inductor_core_"])),
+        ("Inductor copper", "Inductor_copper_",
+         _total(boost, ["Inductor_copper_"]),
+         _total(totem_r, ["Inductor_copper_"])),
+        ("MOSFET conduction+switching",
+         "MOSFET_conduction_|MOSFET_switching_|HF_active_conduction_|HF_active_switching_|HF_SR_conduction_|HF_SR_switch_off_|HF_SR_deadtime_|HF_SR_Coss_|Slow_leg_conduction_",
+         _total(boost, ["MOSFET_conduction_", "MOSFET_switching_"]),
+         _total(totem_r, ["HF_active_conduction_", "HF_active_switching_",
+                          "HF_SR_conduction_", "HF_SR_switch_off_",
+                          "HF_SR_deadtime_", "HF_SR_Coss_",
+                          "Slow_leg_conduction_"])),
+        ("Coss + gate drive",
+         "MOSFET_Coss_|MOSFET_gate_|HF_active_Coss_|HF_active_gate_|HF_SR_gate_|Slow_leg_gate_",
+         _total(boost, ["MOSFET_Coss_", "MOSFET_gate_"]),
+         _total(totem_r, ["HF_active_Coss_", "HF_active_gate_",
+                          "HF_SR_gate_", "Slow_leg_gate_"])),
+        ("Diode (fwd + RR)", "Diode_",
+         _total(boost, ["Diode_"]),
+         0.0),
+        ("Bridge rectifier", "Bridge_",
+         _total(boost, ["Bridge_"]),
+         0.0),
+        ("Capacitor ESR", "Capacitor_",
+         _total(boost, ["Capacitor_"]),
+         _total(totem_r, ["Capacitor_"])),
+    ]
+
+    click.echo(f"{'Component':<34} {'Boost(W)':>9} {'Totem(W)':>9} {'Delta(W)':>9}")
+    click.echo("-" * 62)
+    for label, _, b, t in rows:
+        click.echo(f"{label:<34} {b:>8.1f}W {t:>8.1f}W {t-b:>8.1f}")
+    click.echo("-" * 62)
+    click.echo(f"{'TOTAL':<34} {boost['total_loss']:>8.1f}W "
+               f"{totem_r['total_loss']:>8.1f}W "
+               f"{totem_r['total_loss']-boost['total_loss']:>8.1f}")
+    saved = boost["total_loss"] - totem_r["total_loss"]
+    click.echo(f"\nEfficiency:  boost={boost['efficiency']*100:.2f}%  "
+               f"totem={totem_r['efficiency']*100:.2f}%  "
+               f"(+{(totem_r['efficiency']-boost['efficiency'])*100:.2f} pt, "
+               f"{saved:.1f} W saved)")
+
+    th = totem_r["thermal"]
+    if th["enabled"]:
+        click.echo(f"Totem thermal: Tj_hf={th['t_j_hf']:.0f}C  "
+                   f"Tj_slow={th['t_j_slow']:.0f}C  "
+                   f"T_wind={th['t_winding']:.0f}C")
+
+    if plot:
+        _plot_topology_compare(rows, boost, totem_r)
+
+
+def _plot_topology_compare(rows, boost, totem_r):
+    """Grouped bar chart: boost vs totem per-component losses."""
+    labels = [r[0] for r in rows]
+    b_vals = [r[2] for r in rows]
+    t_vals = [r[3] for r in rows]
+    x = np.arange(len(labels))
+    w = 0.38
+    fig, ax = plt.subplots(figsize=(11, 6))
+    ax.bar(x - w / 2, b_vals, w, label=f"Bridge boost ({boost['efficiency']*100:.2f}%)",
+           color="#d1495b")
+    ax.bar(x + w / 2, t_vals, w, label=f"Totem-pole ({totem_r['efficiency']*100:.2f}%)",
+           color="#2e86ab")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=25, ha="right", fontsize=9)
+    ax.set_ylabel("Loss (W)")
+    ax.set_title(f"Topology comparison — "
+                 f"{boost['spec'].pout_total/1000:.1f}kW, "
+                 f"fsw={boost['spec'].fsw/1000:.0f}kHz")
+    ax.legend()
+    ax.grid(True, axis="y", alpha=0.3)
+    save_dir = os.path.join(os.path.expanduser("~"), "pfc_design", "output")
+    os.makedirs(save_dir, exist_ok=True)
+    f = os.path.join(save_dir, "topology_compare.png")
+    plt.tight_layout()
+    plt.savefig(f, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    click.echo(f"Comparison chart saved: {f}")
 
 
 @cli.command()
@@ -275,7 +582,23 @@ def _print_summary(result):
                    f"ΔIpp_actual={im.get('delta_i_pp_actual_A', 0):.2f}A)")
     click.echo(f"MOSFET: {mos.part_number} ({mos.technology}) | "
                f"Rds25={mos.rds_on_25c*1000:.0f}mΩ | Vds={mos.vds_max:.0f}V")
-    click.echo(f"Wire: {design.wire_d_mm}mm x{design.n_parallel} | Window fill: {design.kw*100:.1f}%")
+    dio = result.get("diode")
+    if dio is not None:
+        th = result.get("thermal", {})
+        t_j_dio = th.get("t_j_diode", 80.0)
+        click.echo(f"Diode:  {dio.part_number} ({dio.technology}) | "
+                   f"Vf({t_j_dio:.0f}C)={dio.vf_at(t_j_dio):.2f}V | "
+                   f"Vrr={dio.vrr_max:.0f}V")
+    wire_d = design.wire_d_mm
+    wire_n = design.n_parallel
+    click.echo(f"Wire: {wire_d}mm x{wire_n} | Window fill: {design.kw*100:.1f}%")
+
+    th = result.get("thermal", {})
+    if th.get("enabled"):
+        click.echo(f"Thermal: Tj_mos={th['t_j_mosfet']:.0f}C  "
+                   f"Tj_dio={th['t_j_diode']:.0f}C  "
+                   f"T_wind={th['t_winding']:.0f}C  "
+                   f"(Rth_mos={th['rth_mosfet_ja']:.2f} K/W)")
 
 
 def _print_loss_table(result):
@@ -379,6 +702,15 @@ def _export_loss_trace_csv(result, path):
     vf = spec.diode_vf
     rd = spec.diode_rd
     qrr = 2e-6 if spec.diode_type.upper() != "SIC" else 0.0
+    # Switching energy: datasheet Eon/Eoff curves if available, else tr/tf ramp
+    if mosfet.eon_ref_uj > 0 and mosfet.eoff_ref_uj > 0:
+        k_on = mosfet.eon_ref_uj * 1e-6 / (mosfet.e_ref_v * mosfet.e_ref_i)
+        k_off = mosfet.eoff_ref_uj * 1e-6 / (mosfet.e_ref_v * mosfet.e_ref_i)
+        e_on_fn = lambda i: k_on * vout * i
+        e_off_fn = lambda i: k_off * vout * i
+    else:
+        e_on_fn = lambda i: 0.5 * vout * i * tr
+        e_off_fn = lambda i: 0.5 * vout * i * tf
 
     # Winding Rdc / Rac (simplified — approximate, same as loss model)
     from .magnetics.winding import skin_effect_factor, proximity_factor, dc_resistance
@@ -419,8 +751,8 @@ def _export_loss_trace_csv(result, path):
         mosfet_cond = rds_tj * duty_i * i_rms_sq_i
 
         # MOSFET switching energy density
-        mosfet_eon = 0.5 * vout * trace.i_valley[i] * tr
-        mosfet_eoff = 0.5 * vout * trace.i_peak[i] * tf
+        mosfet_eon = e_on_fn(trace.i_valley[i])
+        mosfet_eoff = e_off_fn(trace.i_peak[i])
         # Per-switching-cycle energy → per-radian average over half cycle
         # E per radian = fsw * E_per_switching * (T_half / pi) ≈ E_per_sw / dtheta
         # Actually simpler: the density for this theta bin is fsw * E(θ) / pi
@@ -609,6 +941,77 @@ def _print_infeasible_summary(df):
     click.echo("\nTop constraint strings:")
     for reason, count in failed.items():
         click.echo(f"  {count:>4}  {reason}")
+
+
+def _run_heuristic_stage(df, spec, cores, mosfets, db, n_cores,
+                         do_refine, do_heuristic):
+    """Post-grid refinement: local polish of top grid designs + DE global search."""
+    from .optimization.scipy_opt import refine_design
+    from .optimization.heuristic import global_search
+    from .models.system import SystemAnalyzer
+
+    analyzer = SystemAnalyzer(db)
+    mdb = MosfetDatabase()
+    rows = []
+
+    feasible = df[df["feasible"]]
+    grid_best_loss = (float(feasible["P_total_W"].min())
+                      if len(feasible) > 0 else None)
+
+    if do_refine and len(feasible) > 0:
+        click.echo("\n--- Local Refine (Nelder-Mead on fsw x ripple) ---")
+        top_grid = feasible.nsmallest(min(5, len(feasible)), "P_total_W")
+        for _, row in top_grid.iterrows():
+            core = db.get_by_part_number(row["core"])
+            mosfet = mdb.get(row["mosfet"])
+            if core is None or mosfet is None:
+                continue
+            r = refine_design(analyzer, spec, core, mosfet,
+                              x0=(row["fsw_kHz"], row["ripple_ratio"]),
+                              n_cores=n_cores)
+            r["origin"] = f"refine (grid seed fsw={row['fsw_kHz']:.0f}k)"
+            rows.append(r)
+
+    if do_heuristic:
+        click.echo("\n--- Global Search (differential evolution) ---")
+        click.echo(f"  searching fsw x ripple x {len(cores)} cores x {len(mosfets)} MOSFETs...")
+        r = global_search(analyzer, spec, cores, mosfets, n_cores=n_cores)
+        r["origin"] = "global search (DE)"
+        rows.append(r)
+
+    if not rows:
+        return
+
+    click.echo(f"\n{'Stage':<34} {'fsw':>5} {'r':>4} {'Core':<18} {'MOSFET':<18} "
+               f"{'P_tot':>7} {'eta':>6} {'ok?':>4} {'Δr_m':>5} {'evals':>6}")
+    click.echo("-" * 112)
+    for r in rows:
+        risk = "yes" if r["feasible"] else "no"
+        click.echo(
+            f"{r['origin']:<34} {r['fsw_kHz']:>4.1f}k {r['ripple_ratio']:>4.2f} "
+            f"{r['core']:<18} {r['mosfet']:<18} "
+            f"{r['loss_W']:>6.1f}W {r['efficiency_pct']:>5.2f}% "
+            f"{risk:>4} {r['actual_ripple_margin']:>5.2f} {r['evaluations']:>6}"
+        )
+
+    feasible_heu = [r for r in rows if r["feasible"]]
+    if feasible_heu:
+        best = min(feasible_heu, key=lambda r: r["loss_W"])
+        click.echo("\n--- Heuristic improvement vs grid ---")
+        click.echo(f"  best heuristic: {best['loss_W']:.1f}W @ "
+                   f"{best['fsw_kHz']:.1f}kHz  ({best['core']} + {best['mosfet']})")
+        if grid_best_loss is not None:
+            delta = grid_best_loss - best["loss_W"]
+            click.echo(f"  best grid:     {grid_best_loss:.1f}W")
+            if delta > 1e-9:
+                click.echo(f"  improvement:   {delta:.1f}W saved "
+                           f"({delta/grid_best_loss*100:.1f}%)")
+            else:
+                click.echo("  improvement:   none (grid best already optimal in region)")
+    else:
+        click.echo("\nNo feasible design found by heuristic stage.")
+
+
 
 
 if __name__ == "__main__":

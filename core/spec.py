@@ -25,6 +25,13 @@ class MosfetSpec:
     vgs: float
     package: str = ""
     price_usd: float = 0.0
+    # Datasheet switching energy (reference point). When both are set,
+    # the loss model scales them linearly: E(V,I) = E_ref * V/V_ref * I/I_ref.
+    # Leave 0.0 to fall back to the tr/tf linear-ramp approximation.
+    eon_ref_uj: float = 0.0
+    eoff_ref_uj: float = 0.0
+    e_ref_v: float = 400.0
+    e_ref_i: float = 20.0
 
     @property
     def rds_on(self) -> float: return self.rds_on_25c
@@ -84,6 +91,83 @@ class MosfetDatabase:
 
 
 @dataclass
+class DiodeSpec:
+    """Boost diode specification from database.
+
+    Vf and Rd are stored at 25 °C and 150 °C; the loss model
+    interpolates linearly between them at the junction temperature.
+    """
+    manufacturer: str
+    part_number: str
+    technology: str           # SiC Schottky / Si Fast Recovery
+    vrr_max: float
+    if_25c: float
+    vf_25c: float
+    vf_150c: float
+    rd_25c: float = 0.0
+    rd_150c: float = 0.0
+    qrr_nc: float = 0.0
+    trr_ns: float = 0.0
+    package: str = ""
+    price_usd: float = 0.0
+
+    def vf_at(self, t_j: float) -> float:
+        """Forward voltage at junction temperature (°C)."""
+        k = (t_j - 25.0) / 125.0
+        return self.vf_25c + k * (self.vf_150c - self.vf_25c)
+
+    def rd_at(self, t_j: float) -> float:
+        """Dynamic forward resistance at junction temperature (°C)."""
+        k = (t_j - 25.0) / 125.0
+        return self.rd_25c + k * (self.rd_150c - self.rd_25c)
+
+    @property
+    def qrr(self) -> float:
+        """Reverse recovery charge in coulombs (0 for SiC Schottky)."""
+        return self.qrr_nc * 1e-9
+
+    @property
+    def is_sic(self) -> bool:
+        return "sic" in self.technology.lower()
+
+
+class DiodeDatabase:
+    """Loadable database of boost diode specifications."""
+
+    def __init__(self, path: str | None = None):
+        if path is None:
+            path = str(Path(__file__).parent.parent / "data" / "diodes.json")
+        with open(path) as f:
+            data = json.load(f)
+        self._diodes: list[DiodeSpec] = []
+        for entry in data["diodes"]:
+            self._diodes.append(DiodeSpec(**entry))
+
+    @property
+    def all(self) -> list[DiodeSpec]:
+        return self._diodes
+
+    def get(self, part_number: str) -> Optional[DiodeSpec]:
+        for d in self._diodes:
+            if d.part_number.lower() == part_number.lower():
+                return d
+        return None
+
+    def query(self, vrr_min: float = 0, vrr_max: float = float('inf'),
+              technology: str = "") -> list[DiodeSpec]:
+        """Filter diodes by reverse voltage and technology."""
+        results = []
+        tech = technology.strip().lower()
+        for d in self._diodes:
+            if d.vrr_max < vrr_min or d.vrr_max > vrr_max:
+                continue
+            if tech and tech != "all" and tech not in d.technology.lower():
+                continue
+            results.append(d)
+        return sorted(results, key=lambda x: x.vf_25c)
+
+
+@dataclass
 class DesignSpec:
     """All user-facing design inputs for a two-phase interleaved PFC.
 
@@ -116,6 +200,7 @@ class DesignSpec:
     diode_vf: float = 1.5
     diode_rd: float = 0.1
     diode_type: str = "SiC"
+    diode_part: Optional[str] = "C6D20065A"  # DiodeDatabase part (default: 20A SiC)
 
     # Bridge rectifier
     bridge_vf: float = 1.0
@@ -134,6 +219,19 @@ class DesignSpec:
 
     # Thermal
     t_ambient: float = 45.0
+
+    # Self-consistent loss↔temperature loop (enabled by thermal_model=True)
+    thermal_model: bool = False
+    rth_mosfet_jc: float = 0.45    # K/W junction→case (datasheet)
+    rth_mosfet_cs: float = 0.50    # K/W case→heatsink (thermal pad)
+    rth_mosfet_sa: float = 1.20    # K/W heatsink→ambient (design choice)
+    rth_diode_ja: float = 2.50     # K/W junction→ambient total
+    rth_inductor: float = 4.00     # K/W winding/core→ambient (forced air)
+
+    def clone(self) -> "DesignSpec":
+        """Deep-copy this spec (independent instance, identical values)."""
+        return DesignSpec(**{k: v for k, v in self.__dict__.items()
+                             if not k.startswith('_')})
 
     @property
     def pout_per_phase(self) -> float:

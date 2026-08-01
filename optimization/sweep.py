@@ -9,6 +9,9 @@ from ..core.operating_point import compute_mathcad_operating_point
 from ..magnetics.core_database import CoreDatabase
 from ..magnetics.core_entry import CoreSpec
 from ..models.system import SystemAnalyzer
+from .feasibility import (
+    DEFAULT_RIPPLE_MARGIN_LIMIT, DEFAULT_RIPPLE_RATIO_LIMIT, evaluate_feasibility,
+)
 
 
 class ParamSweep:
@@ -91,23 +94,17 @@ class ParamSweep:
                 losses = result["losses"]
                 ind_meta = losses["inductor"].metadata
 
-                # Constraint checks
-                feasible = True
-                constraints = []
+                # Constraint checks (shared with refine/heuristic search)
+                report = evaluate_feasibility(
+                    result, core,
+                    ripple_margin_limit=actual_ripple_margin_limit,
+                    ripple_ratio_limit=actual_ripple_ratio_limit,
+                )
+                feasible = report.feasible
+                constraints = list(report.reasons)
 
                 b_max = ind_meta.get("B_max_T", 0)
-                if b_max > core.bs_T * 0.7:
-                    feasible = False
-                    constraints.append(f"Bmax={b_max:.3f}T>{core.bs_T*0.7:.3f}T")
-
-                if design.kw > 0.6:
-                    feasible = False
-                    constraints.append(f"kw={design.kw:.0%}>60%")
-
                 sat_pct = ind_meta.get("saturation_pct", 100)
-                if sat_pct < 20:
-                    feasible = False
-                    constraints.append(f"sat={sat_pct:.0f}%<20%")
 
                 # Actual ripple metrics
                 im = result.get("inductor_metrics", {})
@@ -116,28 +113,25 @@ class ParamSweep:
                 actual_ripple_basis = round(im.get("actual_ripple_ratio_peak_basis", 0.0), 4)
                 L_eff_ratio = round(im.get("L_eff_ratio", 0.0), 4)
 
-                # Ripple constraint check
-                ripple_margin_exceeded = actual_ripple_margin > actual_ripple_margin_limit
-                ripple_ratio_exceeded = actual_ripple_basis > actual_ripple_ratio_limit
-                feasible_by_actual_ripple = not (ripple_margin_exceeded or ripple_ratio_exceeded)
-
-                if not feasible_by_actual_ripple:
-                    reasons = []
-                    if ripple_margin_exceeded:
-                        reasons.append(
-                            f"ripple_margin={actual_ripple_margin:.2f}"
-                            f">{actual_ripple_margin_limit:.2f}")
-                    if ripple_ratio_exceeded:
-                        reasons.append(
-                            f"ripple_ratio={actual_ripple_basis:.3f}"
-                            f">{actual_ripple_ratio_limit:.3f}")
+                if report.failed_actual_ripple:
+                    constraints = [r for r in report.reasons
+                                   if not r.startswith("ripple_")]
                     if allow_aggressive_ripple:
+                        feasible = not (report.failed_bmax or report.failed_window
+                                        or report.failed_saturation)
                         constraints.append(
-                            f"aggressive_ripple_warning: {'; '.join(reasons)}")
+                            "aggressive_ripple_warning: "
+                            + "; ".join(report.ripple_reasons))
                     else:
                         feasible = False
                         constraints.append(
-                            f"ripple_constraint: {'; '.join(reasons)}")
+                            "ripple_constraint: "
+                            + "; ".join(report.ripple_reasons))
+
+                feasible_by_actual_ripple = (
+                    not report.failed_actual_ripple if not allow_aggressive_ripple
+                    else True
+                )
 
                 results.append({
                     "fsw_kHz": spec.fsw / 1000,
@@ -184,10 +178,10 @@ class ParamSweep:
                     "actual_ripple_risk_level": actual_ripple_risk,
                     "L_eff_ratio": L_eff_ratio,
                     "target_ripple_ratio": spec.ripple_ratio,
-                    "failed_bmax": b_max > core.bs_T * 0.7,
-                    "failed_window": design.kw > 0.6,
-                    "failed_saturation": sat_pct < 20,
-                    "failed_actual_ripple": not feasible_by_actual_ripple,
+                    "failed_bmax": report.failed_bmax,
+                    "failed_window": report.failed_window,
+                    "failed_saturation": report.failed_saturation,
+                    "failed_actual_ripple": report.failed_actual_ripple,
                 })
             except Exception as e:
                 results.append({

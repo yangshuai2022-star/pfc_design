@@ -22,6 +22,7 @@ def mathcad_spec():
         eta_target=0.96,
         core_material_pref="Sendust",
         diode_vf=1.5, diode_rd=0.1, diode_type="SiC",
+        diode_part=None,           # keep the Mathcad Vf/Rd comparison path
         bridge_vf=1.0,
         c_out_total=1320e-6, cap_esr=0.15, cap_n_parallel=4,
         cap_tan_delta=0.25,
